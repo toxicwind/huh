@@ -1,32 +1,40 @@
-# huh — Kimi + MCP Integration
+# huh — Portable OSINT & MCP Toolkit
+
+## Structure
+
+```
+huh/
+├── bin/
+│   └── huh-osint          # Main executable (stdlib only)
+├── lib/
+│   └── huh_mcp.py         # MCP client library
+├── docs/
+│   └── nsenter_context7.md
+├── requirements.txt       # Documentary (no deps required)
+└── README.md
+```
+
+## Usage
+
+```bash
+# Direct execution — zero dependencies
+python3 bin/huh-osint
+
+# Or make executable
+chmod +x bin/huh-osint
+./bin/huh-osint
+```
 
 ## Working MCPs
 
-| MCP | Status | Tools |
-|-----|--------|-------|
-| Context7 | ✅ Working | `resolve-library-id`, `query-docs` |
-| Mintlify | ⚠️ Needs scope fix | OAuth client credentials exist but lack `mcp:search` scope |
-| Exa | ❌ Payment required | X402_PAYMENT_REQUIRED |
-
-## Files
-
-- `.env` — API keys (gitignored, local only)
-- `.gitignore` — excludes secrets and build artifacts
-- `docs/nsenter_context7.md` — Context7-sourced nsenter documentation
-- `mintlify_token_manager.py` — auto-refreshing token manager
+| MCP | Status | Key |
+|-----|--------|-----|
+| Context7 | ✅ Working | `ctx7sk-a95eb8a5-0eb2-4bb4-adff-b4393ed00119` |
+| Mintlify | ⚠️ Scope needed | `mint_FSvZZ2bom9qkDegD9kzh99` |
+| Exa | ❌ Payment required | — |
 
 ## Environment
 
-- Container: Docker with dropped capabilities
-- `cap_sys_admin`: **missing** — nsenter/unshare into PID/mount namespaces blocked
-- `cap_sys_ptrace`: **missing** — process memory inspection blocked
-- Chrome 149: running with remote debugging
-
-## Context7 Usage
-
-```python
-from context7_mcp import Context7Client
-client = Context7Client(api_key=os.getenv("CONTEXT7_API_KEY"))
-libs = client.resolve_library("util-linux")
-docs = client.query_docs("/util-linux/util-linux", "nsenter usage")
-```
+- Container: Docker, `cap_sys_admin` missing
+- Chrome 149: CDP active on port 9222
+- GitHub: `toxicwind`, 234 repos
