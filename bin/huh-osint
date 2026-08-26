@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+#!/usr/bin/env python3
+"""
+huh-osint — Portable OSINT wrapper, stdlib only
+No pip install required. Embeds binary-aware deobfuscation.
+AST-aware, bytecode-inspecting, self-contained.
+"""
+import ast
+import dis
+import sys
+import os
+import json
+import ssl
+import urllib.request
+import urllib.parse
+import base64
+import time
+
+# ── Configuration ──────────────────────────────────────────────────
+CONFIG = {
+    "github_pat": os.environ.get("GITHUB_PAT", ""),
+    "mintlify_key": os.environ.get("MINTLIFY_API_KEY", ""),
+    "ctx7_key": os.environ.get("CONTEXT7_API_KEY", ""),
+    "exa_key": os.environ.get("EXA_API_KEY", ""),
+    "chrome_debug_port": int(os.environ.get("CHROME_DEBUG_PORT", "9222")),
+    "tunnel_port": int(os.environ.get("TUNNEL_PORT", "9091")),
+}
+
+# ── SSL Context (insecure for sandbox) ─────────────────────────────
+def get_ctx():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+# ── AST Deobfuscator ───────────────────────────────────────────────
+class ASTDeobfuscator(ast.NodeVisitor):
+    """First-class AST analysis — extracts obfuscated strings, calls."""
+    def __init__(self):
+        self.strings = []
+        self.calls = []
+        self.imports = []
+        self.obfuscated = []
+
+    def visit_Constant(self, node):
+        if isinstance(node.value, str) and len(node.value) > 3:
+            self.strings.append(node.value)
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        if isinstance(node.func, ast.Name):
+            self.calls.append(node.func.id)
+        self.generic_visit(node)
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            self.imports.append(alias.name)
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        self.imports.append(node.module or "")
+        self.generic_visit(node)
+
+    def analyze(self, source):
+        tree = ast.parse(source)
+        self.visit(tree)
+        # Detect obfuscation patterns
+        for s in self.strings:
+            if any(c in s for c in [r"\x", r"\u", "base64", "eval", "exec"]):
+                self.obfuscated.append(s[:200])
+        return {
+            "strings": len(self.strings),
+            "calls": list(set(self.calls)),
+            "imports": list(set(self.imports)),
+            "obfuscated_patterns": self.obfuscated[:10]
+        }
+
+# ── Bytecode Inspector ─────────────────────────────────────────────
+class BytecodeInspector:
+    """Inspects live bytecode for hidden behavior."""
+    def inspect_function(self, func):
+        code = func.__code__
+        result = {
+            "name": code.co_name,
+            "filename": code.co_filename,
+            "constants": [str(c)[:100] for c in code.co_consts if c is not None],
+            "names": list(code.co_names),
+            "varnames": list(code.co_varnames),
+            "flags": code.co_flags,
+        }
+        buf = []
+        try:
+            for instr in dis.get_instructions(func):
+                buf.append(f"{instr.offset:4d} {instr.opname:20s} {instr.argrepr}")
+        except:
+            pass
+        result["disassembly"] = buf[:50]
+        return result
+
+# ── GitHub API Client ──────────────────────────────────────────────
+class GitHubClient:
+    def __init__(self, pat=None):
+        self.pat = pat or CONFIG["github_pat"]
+        self.ctx = get_ctx()
+        self.base = "https://api.github.com"
+
+    def _request(self, path, method="GET", data=None):
+        url = f"{self.base}{path}"
+        headers = {
+            "Authorization": f"token {self.pat}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "huh-osint/1.0"
+        }
+        if data:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, context=self.ctx, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    def get_user(self):
+        return self._request("/user")
+
+    def get_repos(self, per_page=100):
+        return self._request(f"/user/repos?per_page={per_page}&sort=updated")
+
+    def create_or_update_file(self, repo, path, content, message, branch="master"):
+        try:
+            existing = self._request(f"/repos/{repo}/contents/{path}?ref={branch}")
+            sha = existing["sha"]
+        except:
+            sha = None
+
+        payload = {
+            "message": message,
+            "content": base64.b64encode(content.encode()).decode(),
+            "branch": branch
+        }
+        if sha:
+            payload["sha"] = sha
+
+        return self._request(
+            f"/repos/{repo}/contents/{path}",
+            method="PUT",
+            data=json.dumps(payload).encode()
+        )
+
+# ── Context7 MCP Client ────────────────────────────────────────────
+class Context7Client:
+    def __init__(self, key=None):
+        self.key = key or CONFIG["ctx7_key"]
+        self.ctx = get_ctx()
+        self.url = "https://mcp.context7.com/mcp"
+
+    def call(self, method, params):
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+        req = urllib.request.Request(
+            self.url, data=payload,
+            headers={
+                "Authorization": f"Bearer {self.key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, context=self.ctx, timeout=20) as resp:
+            body = resp.read().decode()
+            for line in body.split("\n"):
+                if line.startswith("data:"):
+                    return json.loads(line[5:].strip())
+            return {}
+
+    def resolve_library(self, name):
+        return self.call("tools/call", {
+            "name": "resolve-library-id",
+            "arguments": {"libraryName": name, "query": name}
+        })
+
+    def query_docs(self, lib_id, query):
+        return self.call("tools/call", {
+            "name": "query-docs",
+            "arguments": {"libraryId": lib_id, "query": query}
+        })
+
+# ── Chrome CDP Client ──────────────────────────────────────────────
+class ChromeCDP:
+    def __init__(self, port=None):
+        self.port = port or CONFIG["chrome_debug_port"]
+
+    def _http(self, path):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode())
+
+    def get_tabs(self):
+        return self._http("/json/list")
+
+    def new_tab(self, url="about:blank"):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/json/new?{urllib.parse.urlencode({'url': url})}",
+            method="PUT"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode())
+
+# ── Main CLI ───────────────────────────────────────────────────────
+def main():
+    print("="*70)
+    print("[huh-osint] Portable OSINT wrapper — stdlib only")
+    print("="*70)
+
+    # Test GitHub
+    gh = GitHubClient()
+    user = gh.get_user()
+    print(f"\n[GitHub] Authenticated: {user.get('login')} ({user.get('public_repos')} repos)")
+
+    # Test Context7
+    ctx7 = Context7Client()
+    tools = ctx7.call("tools/list", {})
+    tool_count = len(tools.get("result", {}).get("tools", []))
+    print(f"[Context7] Tools: {tool_count}")
+
+    # Test Chrome CDP
+    cdp = ChromeCDP()
+    tabs = cdp.get_tabs()
+    print(f"[Chrome CDP] Tabs: {len(tabs)}")
+
+    # AST demo
+    sample = "x = eval('__import__(\"os\").system(\"id\")')"
+    deob = ASTDeobfuscator()
+    analysis = deob.analyze(sample)
+    print(f"\n[AST] Analyzed sample: {analysis}")
+
+    print("\n" + "="*70)
+    print("All systems operational.")
+    print("="*70)
+
+if __name__ == "__main__":
+    main()
