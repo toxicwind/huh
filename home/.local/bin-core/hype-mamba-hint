@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+current_dir=$(pwd)
+rec_spec=""
+search_dir="$current_dir"
+while :; do
+	if [[ -f "$search_dir/.mamba-env" ]]; then
+		while IFS= read -r line; do
+			line=${line%%#*}
+			line=$(printf '%s' "$line" | xargs || true)
+			if [[ -n $line ]]; then
+				rec_spec=$line
+				break
+			fi
+		done <"$search_dir/.mamba-env"
+		break
+	fi
+	[[ $search_dir == / ]] && break
+	parent=$(dirname "$search_dir")
+	[[ $parent == "$search_dir" ]] && break
+	search_dir=$parent
+done
+
+active_label=""
+active_prefix=""
+if [[ -n ${CONDA_DEFAULT_ENV:-} ]]; then
+	active_label=$CONDA_DEFAULT_ENV
+fi
+if [[ -n ${MAMBA_DEFAULT_ENV:-} && -z $active_label ]]; then
+	active_label=$MAMBA_DEFAULT_ENV
+fi
+if [[ -n ${CONDA_PREFIX:-} ]]; then
+	active_prefix=$CONDA_PREFIX
+fi
+
+recommend_label=""
+recommend_path=""
+if [[ -n $rec_spec ]]; then
+	case $rec_spec in
+	prefix:*)
+		recommend_path=${rec_spec#prefix:}
+		recommend_label=$(basename "$recommend_path")
+		;;
+	/*)
+		recommend_path=$rec_spec
+		recommend_label=$(basename "$rec_spec")
+		;;
+	*)
+		recommend_label=$rec_spec
+		base_root=${MAMBA_ROOT_PREFIX:-$HOME/.local/share/mamba}
+		recommend_path="$base_root/envs/$rec_spec"
+		;;
+	esac
+fi
+
+if [[ -z $recommend_label && -z $active_label ]]; then
+	exit 0
+fi
+
+if [[ -n $active_prefix && -n $recommend_path ]]; then
+	if [[ $active_prefix == "$recommend_path" ]]; then
+		active_label=$recommend_label
+	fi
+fi
+
+output=""
+if [[ -n $recommend_label ]]; then
+	icon="󰏗"
+	if [[ -n $active_label && ("$active_label" == "$recommend_label") ]]; then
+		output="$icon $recommend_label ✓"
+	else
+		status_suffix=""
+		if [[ -n $recommend_path && ! -d $recommend_path ]]; then
+			status_suffix=" · create"
+		fi
+		if [[ -n $active_label ]]; then
+			status_suffix+=" → $active_label"
+		fi
+		output="$icon $recommend_label$status_suffix"
+	fi
+else
+	output="󰏗 ${active_label}"
+fi
+
+printf '%s' "$output"

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+status=${STARSHIP_CMD_STATUS:-0}
+if [[ -n ${STARSHIP_PIPE_STATUS:-} ]]; then
+	# Use first non-zero from pipeline if provided
+	for code in ${STARSHIP_PIPE_STATUS}; do
+		if [[ $code -ne 0 ]]; then
+			status=$code
+			break
+		fi
+	done
+fi
+if [[ ${status} -eq 0 ]]; then
+	printf 'ヽ(´▽`)/'
+else
+	printf '(ﾉ˚Д˚)ﾉ %d' "$status"
+fi

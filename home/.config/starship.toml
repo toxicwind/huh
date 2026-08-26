@@ -1,0 +1,137 @@
+palette = "oxide"
+add_newline = true
+
+[palettes.oxide]
+ink      = "#1f232d"
+surface  = "#2b303b"
+surface2 = "#353b47"
+text     = "#cdd6f4"
+muted    = "#7f8ba3"
+accent1  = "#8caaee"
+accent2  = "#a6d189"
+accent3  = "#ef9f76"
+ok       = "#89e5b3"
+warn     = "#e5c890"
+bad      = "#e78284"
+
+format = """
+[╭](fg:muted) $directory$read_only $git_branch$git_status $jobs $custom.envbadge $fill $custom.mamba $battery
+[╰](fg:muted) $status $custom.kaomortal $character
+"""
+right_format = "$custom.rclock"
+
+[fill]
+symbol = "·"
+
+[directory]
+style = "bold fg:accent1"
+truncate_to_repo = true
+truncation_length = 3
+read_only = " 🔒"
+format = "[$path]($style)"
+
+[git_branch]
+symbol = "⎇ "
+style = "fg:accent2"
+format = '[$symbol$branch]($style) '
+
+[git_status]
+style = "fg:accent3"
+format = '([$all_status$ahead_behind]($style) )'
+conflicted = "≠"
+deleted = "✖"
+modified = "±"
+staged = "+"
+renamed = "→"
+stashed = "⧉"
+ahead = "⇡${count}"
+behind = "⇣${count}"
+diverged = "⇕"
+
+[jobs]
+threshold = 1
+number_threshold = 1
+style = "fg:accent3"
+format = '[⚙ $number ]($style)'
+
+[battery]
+disabled = false
+format = '[ $symbol $percentage ]($style) '
+style = "fg:text"
+full_symbol = ""
+charging_symbol = "⚡"
+discharging_symbol = ""
+empty_symbol = ""
+[[battery.display]]
+threshold = 25
+style = "fg:warn"
+
+[status]
+disabled = false
+format = '[$symbol$status]($style) '
+map_symbol = true
+style = "fg:accent3"
+symbol = "✘"
+success_symbol = "✔"
+not_executable_symbol = "…"
+
+[character]
+format = "$symbol"
+success_symbol = "[❯](fg:accent1) "
+error_symbol = "[✖](fg:bad) "
+vicmd_symbol = "[❮](fg:accent2) "
+
+[cmd_duration]
+disabled = true
+
+[time]
+disabled = true
+
+[conda]
+disabled = true
+
+[custom.envbadge]
+description = "Micromamba/virtualenv badge"
+shell = ["bash", "--noprofile", "--norc"]
+when = '[[ -n "${CONDA_DEFAULT_ENV:-${VIRTUAL_ENV:-}}" ]] && [[ ${HB_PURE_BASH:-0} != 1 ]]'
+command = 'if [[ -n ${CONDA_DEFAULT_ENV:-} ]]; then printf "%s" "$CONDA_DEFAULT_ENV"; else printf "%s" "${VIRTUAL_ENV##*/}"; fi'
+style = "fg:accent2"
+format = '[🧪 $output]($style) '
+
+[custom.mamba]
+symbol = "μ "
+style = "bold fg:accent1"
+shell = ["bash","--noprofile","--norc"]
+when = '[[ -x "$HOME/.local/bin-core/hype-mamba-hint" && ${HB_PURE_BASH:-0} != 1 ]]'
+command = "$HOME/.local/bin-core/hype-mamba-hint"
+format = '[$symbol$output]($style) '
+
+[custom.kaomortal]
+description = "Kaomoji face"
+shell = ["bash","--noprofile","--norc"]
+command = "$HOME/.local/bin-core/hb-kaomoji-face"
+when = '[[ ${HB_AGENT_MODE:-} != machine && ${HB_PURE_BASH:-0} != 1 ]]'
+format = '[$output](bold fg:accent2) '
+
+[custom.rclock]
+shell = ["bash","--noprofile","--norc"]
+when = '[[ ${HB_PURE_BASH:-0} != 1 ]]'
+command = '''
+cols=${COLUMNS:-80}
+stamp=$(date +%H:%M)
+dur=${PRISM_CMD_MS:-0}
+if ((cols < 70)); then
+  printf "%s" "$stamp"
+  exit 0
+fi
+if ((dur >= 700)); then
+  if ((dur >= 1000)); then
+    printf "%s ⏱ %ds" "$stamp" $((dur/1000))
+  else
+    printf "%s ⏱ %dms" "$stamp" "$dur"
+  fi
+else
+  printf "%s" "$stamp"
+fi
+'''
+format = '[$output](fg:muted)'

@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Manage saved sd-quiet GPU profiles.
+set -euo pipefail
+
+CONFIG_DIR="/etc/sysconfig/sd-quiet.d"
+ACTIVE_CFG="/etc/sysconfig/sd-quiet"
+SERVICE="sd-quiet.service"
+
+require_sudo() {
+	if sudo -n true 2>/dev/null; then
+		SUDO=(sudo -n)
+	else
+		SUDO=(sudo)
+	fi
+}
+
+read_cfg_field() {
+	local file="$1"
+	local field="$2"
+	awk -F= -v key="$field" '$1==key{gsub(/\r/,"",$2);print $2}' "$file"
+}
+
+list_profiles() {
+	[[ -d "$CONFIG_DIR" ]] || {
+		echo "No profiles in $CONFIG_DIR"
+		return 1
+	}
+	printf "%-16s %-10s %s\n" "PROFILE" "GPU" "PATH"
+	for cfg in "$CONFIG_DIR"/*.env; do
+		[[ -f "$cfg" ]] || continue
+		local profile gpu
+		profile="$(read_cfg_field "$cfg" PROFILE)"
+		gpu="$(read_cfg_field "$cfg" GPU)"
+		printf "%-16s %-10s %s\n" "${profile:-$(basename "$cfg")}" "${gpu:-0}" "$cfg"
+	done
+}
+
+show_active() {
+	if [[ -r "$ACTIVE_CFG" ]]; then
+		local profile gpu
+		profile="$(read_cfg_field "$ACTIVE_CFG" PROFILE)"
+		gpu="$(read_cfg_field "$ACTIVE_CFG" GPU)"
+		echo "Active profile: ${profile:-unknown} (GPU ${gpu:-?})"
+		echo "Source: $ACTIVE_CFG"
+	else
+		echo "No active config at $ACTIVE_CFG" >&2
+		return 1
+	fi
+}
+
+apply_profile() {
+	local name="$1"
+	local candidate=""
+
+	if [[ -f "$name" ]]; then
+		candidate="$name"
+	else
+		candidate="$CONFIG_DIR/${name}.env"
+		if [[ ! -f "$candidate" ]]; then
+			candidate="$CONFIG_DIR/${name%-env}.env"
+		fi
+		if [[ ! -f "$candidate" ]]; then
+			candidate="$CONFIG_DIR/${name}.conf"
+		fi
+		if [[ ! -f "$candidate" ]]; then
+			echo "Profile file not found for '$name'" >&2
+			exit 1
+		fi
+	fi
+
+	require_sudo
+	"${SUDO[@]}" install -Dm644 "$candidate" "$ACTIVE_CFG"
+	"${SUDO[@]}" systemctl restart "$SERVICE"
+	echo "Applied $(read_cfg_field "$candidate" PROFILE) → $ACTIVE_CFG"
+	"${SUDO[@]}" systemctl status "$SERVICE" --no-pager -n 0 >/dev/null || true
+}
+
+usage() {
+	cat <<'EOF'
+gpu-profile COMMAND [ARGS]
+
+Commands:
+  list                 List saved profile config files.
+  apply NAME|PATH      Apply saved profile (NAME resolved in /etc/sysconfig/sd-quiet.d).
+  active               Show current active profile.
+  help                 Show this help text.
+
+Examples:
+  gpu-profile list
+  gpu-profile apply sd-max
+  gpu-profile apply /etc/sysconfig/sd-quiet.d/custom.env
+  gpu-profile active
+EOF
+}
+
+cmd="${1:-list}"
+shift || true
+
+case "$cmd" in
+list)
+	list_profiles
+	;;
+apply)
+	[[ $# -ge 1 ]] || {
+		echo "Missing profile name" >&2
+		exit 1
+	}
+	apply_profile "$1"
+	;;
+active | status)
+	show_active
+	;;
+help | -h | --help)
+	usage
+	;;
+*)
+	echo "Unknown command: $cmd" >&2
+	usage >&2
+	exit 1
+	;;
+esac

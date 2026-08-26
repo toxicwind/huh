@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Copy Image to Clipboard
+Comment=Send the current image to the clipboard using wl-copy helper
+Icon=/home/toxic/.local/share/icons/hypebrut-copy.png
+Exec=/home/toxic/.local/bin-core/geeqie-clip.sh %f
+Categories=X-Geeqie;
+OnlyShowIn=X-Geeqie;
+MimeType=image/*;
+X-Geeqie-Hotkey=<Control><Shift>c
+X-Geeqie-Keep-Fullscreen=true

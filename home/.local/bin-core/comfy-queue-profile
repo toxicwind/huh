@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Auto-switch sd-quiet profiles based on ComfyUI queue depth."""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+import urllib.request
+import urllib.error
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8188
+CONFIG_PATH = Path("/etc/sysconfig/sd-quiet")
+
+
+def fetch_queue(host: str, port: int) -> dict[str, Any]:
+    url = f"http://{host}:{port}/queue"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = resp.read()
+        return json.loads(data) if data.strip() else {}
+
+
+def current_profile_name() -> str | None:
+    if not CONFIG_PATH.exists():
+        return None
+    text = CONFIG_PATH.read_text(encoding="utf-8", errors="ignore").splitlines()
+    for line in text:
+        if line.startswith("# "):
+            header = line[2:]
+            return header.split(":", 1)[0].strip()
+    return None
+
+
+def apply_profile(profile: str, dry_run: bool) -> None:
+    if dry_run:
+        print(f"[dry-run] would apply {profile}")
+        return
+    subprocess.run(["gpu-profile", "apply", profile], check=True)
+
+
+def decide_profile(pending: int, high: int, medium: int) -> str:
+    if pending >= high:
+        return "sd-burst"
+    if pending >= medium:
+        return "sd-balance"
+    return "sd-mid"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--high-threshold", type=int, default=400)
+    parser.add_argument("--medium-threshold", type=int, default=120)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--manage-clocks",
+        action="store_true",
+        help="Lock GPU clocks when entering sd-burst, reset when exiting",
+    )
+    parser.add_argument("--fan-burst", type=int, default=88, help="Fan % when in sd-burst")
+    parser.add_argument("--fan-mid", type=int, default=78, help="Fan % when in sd-balance")
+    parser.add_argument("--fan-low", type=int, default=70, help="Fan % when in sd-mid")
+    args = parser.parse_args()
+
+    if args.high_threshold <= args.medium_threshold:
+        parser.error("high threshold must be greater than medium threshold")
+
+    try:
+        queue = fetch_queue(args.host, args.port)
+    except urllib.error.URLError as err:
+        raise SystemExit(f"Failed to query ComfyUI queue: {err}") from err
+
+    pending = len(queue.get("queue_pending") or [])
+    target_profile = decide_profile(pending, args.high_threshold, args.medium_threshold)
+    active_profile = current_profile_name()
+
+    print(f"Pending jobs: {pending}")
+    print(f"Active profile: {active_profile or 'unknown'}")
+    print(f"Target profile: {target_profile}")
+
+    changed = False
+    if active_profile != target_profile:
+        apply_profile(target_profile, args.dry_run)
+        changed = True
+    else:
+        print("Profile already matches target; nothing to do.")
+
+    if args.manage_clocks and not args.dry_run:
+        if target_profile == "sd-burst":
+            subprocess.run(["gpu-clocks", "lock"], check=True)
+        elif active_profile == "sd-burst" and target_profile != "sd-burst":
+            subprocess.run(["gpu-clocks", "reset"], check=True)
+
+        # Fan targets
+        fan_target = {
+            "sd-burst": str(args.fan_burst),
+            "sd-balance": str(args.fan_mid),
+            "sd-mid": str(args.fan_low),
+        }.get(target_profile)
+        if fan_target:
+            subprocess.run(["hb-fan-target", fan_target], check=True)
+
+
+if __name__ == "__main__":
+    main()

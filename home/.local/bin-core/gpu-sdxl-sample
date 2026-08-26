@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+GPU=${GPU:-0}
+FORMAT="power.limit,power.draw,temperature.gpu,fan.speed,utilization.gpu,clocks.sm,clocks.mem"
+nvidia-smi --query-gpu="$FORMAT" --format=csv,noheader -i "$GPU"

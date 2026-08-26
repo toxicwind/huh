@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+speed=${1:?target fan percent}
+DISPLAY=${DISPLAY:-:0}
+XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}
+sudo -n DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" nvidia-settings -a [gpu:0]/GPUFanControlState=1 >/dev/null
+sudo -n DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" nvidia-settings -a [fan:0]/GPUTargetFanSpeed="$speed" >/dev/null
+echo "Fan locked at ${speed}%"

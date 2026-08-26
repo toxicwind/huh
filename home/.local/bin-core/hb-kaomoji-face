@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Kaomortal — dynamic kaomoji engine for prompt modules.
+# Cross-shell friendly; uses exported PRISM_* env from your shell hooks.
+
+set -euo pipefail
+
+# shellcheck disable=SC2034
+
+# ---------- tiny utils ----------
+now_s() { command -v date >/dev/null && date +%s || echo 0; }
+h32() { # FNV-1a 32-bit hash (bash-safe)
+	local s="$*"
+	local h=2166136261 i c
+	for ((i = 0; i < ${#s}; i++)); do
+		printf -v c '%d' "'${s:i:1}"
+		h=$(((h ^ c) * 16777619 & 0xFFFFFFFF))
+	done
+	echo $h
+}
+pick() { # pick from array by seeded index
+	local -n A=$1
+	local seed=$2
+	local n=${#A[@]}
+	((n > 0)) || {
+		printf "(・_・) "
+		return
+	}
+	printf "%s" "${A[$((seed % n))]}"
+}
+
+# ---------- context ----------
+S=${PRISM_LAST_STATUS:-0}
+J=${PRISM_JOBS:-0}
+VIM=${PRISM_VIMODE:-INSERT}      # zsh sets this; bash defaults to INSERT
+GDIRTY=${PRISM_GIT_DIRTY:-0}     # 0 clean / 1 dirty
+MAMBA_ENV=${CONDA_DEFAULT_ENV:-} # micromamba/conda env name if any
+SSH=${SSH_CONNECTION:+1}
+ROOT=$([[ ${EUID:-$(id -u 2>/dev/null)} -eq 0 ]] && echo 1 || echo 0)
+LONG=$([[ ${PRISM_CMD_MS:-0} -ge 5000 ]] && echo 1 || echo 0) # set by hook (ms)
+HOUR=$(command -v date >/dev/null && date +%H || echo 12)
+BAT() {
+	if [[ -d /sys/class/power_supply ]]; then
+		local f
+		for f in /sys/class/power_supply/BAT*/capacity; do
+			[[ -f "$f" ]] && {
+				cat "$f"
+				return
+			}
+		done
+	fi
+	command -v pmset >/dev/null && pmset -g batt 2>/dev/null |
+		awk -F'; *' 'NR==1{gsub("%","",$2); print $2+0; exit}'
+}
+BATT=$(BAT 2>/dev/null || echo 100)
+NIGHT=$([[ $HOUR -ge 0 && $HOUR -le 5 ]] && echo 1 || echo 0)
+
+# Deterministic output for machine mode consumers
+if [[ ${HB_AGENT_MODE:-} == machine || ${HB_MACHINE_MODE:-0} == 1 ]]; then
+	if ((S == 0)); then
+		echo ":)"
+	else
+		echo ":("
+	fi
+	exit 0
+fi
+
+# ---------- kaomoji pools ----------
+# success / upbeat
+# shellcheck disable=SC2034
+K_OK=(
+	"( •̀ω•́ )✧" "(＾▽＾)" "(｡•̀ᴗ-)✧" "(ﾉ^_^)ﾉ" "(^‿^ )" "(๑˃̵ᴗ˂̵)و" "ヽ(•‿•)ノ"
+	"(o^▽^o)" "(^人^)" "(^_−)☆" "(づ｡◕‿‿◕｡)づ" "٩(ᵔᗜᵔ)و" "(っ˘ω˘ς)" "(^▽^)/" "(＾∇＾)ﾉ♪"
+)
+# calm / idle
+# shellcheck disable=SC2034
+K_IDLE=(
+	"(・‿・)" "(˘︶˘)" "(￣ω￣)" "(・_・ )" "(´ｰ\`)" "( ᵕ‿ ᵕ )" "(＾_＾)" "(￣▽￣)"
+	"( ¯▿¯ )" "(๑•͈ᴗ•͈) " "(・_・ヾ" "( ˘ω˘ )" "( ⁰▿⁰ )" "(._.)" "(ゝ‿◕)"
+)
+# thinking / long run
+# shellcheck disable=SC2034
+K_THINK=(
+	"(￣～￣;)" "(；・・)" "(•̀_•́ )" "(¬_¬)" "(눈_눈)" "(・┰・)" "(´・ω・\`)?"
+	"( •_•)>⌐■-■" "(⊙_☉)" "(・・ )?" "(._. )" "(￣^￣ )ゞ" "(๑•̀ ᗜ •́๑)" "(・_・;)" "(・・;)"
+)
+# error / rage / fail
+# shellcheck disable=SC2034
+K_ERR=(
+	"(ﾉ˚Д˚)ﾉ" "(╬\`⊙ω⊙´)" "(ノಠ益ಠ)ノ彡┻━┻" "(ಥ﹏ಥ)" "(;\`Д´)" "(>_<)" "(；´Д\`A"
+	"(҂\` ﾛ ´)ﾉ" "(-̀◞ω◟-́ )" "(ᗒᗣᗕ)՞" "(；￣Д￣)" "(╯°□°）╯︵ ┻━┻" "(>人<)" "(≧Д≦)" "(〒﹏〒)"
+)
+# vi normal (precision)
+# shellcheck disable=SC2034
+K_VI=(
+	"(ง •̀_•́)ง" "(^_−)–☆" "(•̀ᴗ•́)و ̑̑" "( •̀ .̫ •́ )✧" "(ง'̀-'́)ง" "(๑•̀ㅂ•́)و✧"
+	"( •̀д•́)ง" "(•̀_•́ )" "(ง •̀ω•́)ง" "ᕦ(ò_óˇ)ᕤ" "(￣^￣ )ゞ" "( •̀ ᴗ •́ )و" "(｀・ω・´)" "( •̀ᄇ•́ )و"
+)
+# ssh / remote
+# shellcheck disable=SC2034
+K_REMOTE=(
+	"( ^_^)／" "( ◠‿◠ )つ" "(•̀ᴗ•́)و—✈" "(^_^)ノ☎" "(/・0・)" "(づ￣ ³￣)づ" "(^_^)ノ⌁"
+	"(☞ﾟヮﾟ)☞" "(￣▽￣)ノ" "(^o^)/" "(o´▽\`o)ﾉ" "(^ｰ^)ノ" "ヽ(*・ω・)ﾉ" "(＾-＾)／" "(^_^)v"
+)
+# root / authority
+# shellcheck disable=SC2034
+K_ROOT=(
+	"(♛‿♛)" "(¬‿¬)つ︻̷┻̿═━一" "(▀̿Ĺ̯▀̿ ̿)" "(ง •̀_•́)ง☠" "(ಠ_ಠ)☝" "(｀へ´*)ノ"
+	"(•̀ㅁ•́;)" "(＾～＾)b" "(҂◡_◡) ᕤ" "(ง'̀-'́)ง☢" "(◣_◢)" "( ಠ ͜ʖ ಠ )" "(｀・ω・´)ゞ" "(๑•̀ㅂ•́)و✧♜" "(≖ ‿ ≖)"
+)
+# battery low / sleepy
+# shellcheck disable=SC2034
+K_SLEEP=(
+	"(－_－) zzz" "(￣o￣) . z Z" "( ˘ω˘ )ｽﾔｧ" "(。-ω-)zzz" "(－_－)／" "(x _ x)" "(∪.∪ )...zzz"
+	"(－‸ლ)" "(˘_˘٥)" "( －‸－ )" "(ᵕ≀ ᵕ)" "( ᵕ⏠ ᵕ )" "(=_=)" "(ー。ー)" "( -_-)旦"
+)
+# git dirty / messy
+# shellcheck disable=SC2034
+K_DIRTY=(
+	"(；一_一)" "(／。＼)" "(•‿•;) " "(๑•́ ₃ •̀๑)" "(；￣ェ￣)" "(ᵔ.ᵔ;)" "(￣△￣；)"
+	"(・_・;)" "(╯︵╰,)" "(ノ_・。)" "(¬､¬)" "(・へ・)" "(；⌣̀_⌣́)" "(￣ヘ￣;)" "(ಠ_ಠ)ノ"
+)
+# lab / micromamba
+# shellcheck disable=SC2034
+K_MU=(
+	"(μ_μ)" "(・ω・)ノμ" "(｡•̀ᴗ-)✧μ" "(^人^) μ" "(^_^)/~ μ" "( •_•)ノ μ" "μ(•̀ᴗ•́)و"
+	"(￣▽￣)ノμ" "(ง •̀_•́)ง μ" "( •̀ᄇ•́ )و μ" "(o‿o) μ" "(^▽^) μ" "(・◇・)？μ" "(๑˃̵ᴗ˂̵)و μ" "(˘◡˘) μ"
+)
+
+# ---------- choose mood ----------
+mood="OK"
+((S != 0)) && mood="ERR"
+((ROOT == 1 && S == 0)) && mood="ROOT"
+((BATT >= 0 && BATT < 15 && S == 0)) && mood="SLEEP"
+((LONG == 1 && S == 0)) && mood="THINK"
+((GDIRTY > 0 && S == 0)) && mood="DIRTY"
+[[ -n "$MAMBA_ENV" && $S -eq 0 ]] && mood="MU"
+((SSH == 1 && S == 0)) && mood="REMOTE"
+if [[ $VIM == "vicmd" || $VIM == "NORMAL" ]]; then mood="VI"; fi
+((NIGHT == 1 && S == 0)) && [[ $mood == "OK" ]] && mood="SLEEP"
+
+# ---------- seed & print ----------
+SEED=$(h32 "${PWD}|${HOSTNAME}|${mood}|${MAMBA_ENV}|$(now_s)|${J}")
+case "$mood" in
+ERR) pick K_ERR "$SEED" ;;
+ROOT) pick K_ROOT "$SEED" ;;
+THINK) pick K_THINK "$SEED" ;;
+SLEEP) pick K_SLEEP "$SEED" ;;
+DIRTY) pick K_DIRTY "$SEED" ;;
+MU) pick K_MU "$SEED" ;;
+REMOTE) pick K_REMOTE "$SEED" ;;
+VI) pick K_VI "$SEED" ;;
+*) pick K_OK "$SEED" ;;
+esac
+echo

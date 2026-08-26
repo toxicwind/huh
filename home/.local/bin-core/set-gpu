@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Operator-facing helper to manage Stable Diffusion GPU profiles.
+set -euo pipefail
+
+DEFAULT_PROFILE="sd-max"
+SET_GPU_BIN="/usr/local/bin/set-gpu-sd"
+SYSTEMCTL="/usr/bin/systemctl"
+SVC_NAME="sd-quiet.service"
+
+usage() {
+	cat <<'EOF'
+set-gpu [COMMAND]
+
+Commands:
+  (none)|PROFILE   Apply SD GPU profile (sd-max|sd-default|quiet|balanced|sdxl-extreme).
+  apply [FLAGS]    Forward args to set-gpu-sd (e.g. set-gpu apply --profile quiet).
+  status           Show live GPU power/temp/fan table plus active profile.
+  logs             Tail recent sd-quiet journal events.
+  restart          Restart sd-quiet.service with current config.
+  help             Show this message.
+
+Examples:
+  set-gpu                 # apply sd-max (default Stable Diffusion profile)
+  set-gpu quiet           # switch to quiet profile
+  set-gpu apply --set TEMP_MAX=78
+  set-gpu status
+EOF
+}
+
+need_sudo() {
+	if sudo -n true 2>/dev/null; then
+		SUDO=(sudo -n)
+	else
+		SUDO=(sudo)
+	fi
+}
+
+ensure_prereqs() {
+	[[ -x "$SET_GPU_BIN" ]] || {
+		echo "Missing $SET_GPU_BIN" >&2
+		exit 1
+	}
+	need_sudo
+}
+
+apply_profile() {
+	ensure_prereqs
+	local profile="${1:-$DEFAULT_PROFILE}"
+	shift || true
+	"${SUDO[@]}" "$SET_GPU_BIN" --profile "$profile" "$@"
+	"${SUDO[@]}" "$SYSTEMCTL" is-enabled "$SVC_NAME" >/dev/null 2>&1 || "${SUDO[@]}" "$SYSTEMCTL" enable "$SVC_NAME" >/dev/null
+	"${SUDO[@]}" "$SYSTEMCTL" restart "$SVC_NAME"
+	status
+}
+
+status() {
+	command -v nvidia-smi >/dev/null 2>&1 || {
+		echo "nvidia-smi missing" >&2
+		return 1
+	}
+	local cfg="/etc/sysconfig/sd-quiet"
+	local profile="(unknown)"
+	local gpu="?"
+	if [[ -r "$cfg" ]]; then
+		profile="$(awk -F= '$1=="PROFILE"{print $2}' "$cfg" | tr -d '\r\n')"
+		gpu="$(awk -F= '$1=="GPU"{print $2}' "$cfg" | tr -d '\r\n')"
+	fi
+	echo "Profile: ${profile:-unknown} (GPU ${gpu:-?})"
+	nvidia-smi --query-gpu=index,power.limit,power.default_limit,temperature.gpu,fan.speed,utilization.gpu --format=csv
+}
+
+show_logs() {
+	ensure_prereqs
+	"${SUDO[@]}" journalctl -u "$SVC_NAME" -n 25 --no-pager
+}
+
+restart_service() {
+	ensure_prereqs
+	"${SUDO[@]}" "$SYSTEMCTL" restart "$SVC_NAME"
+	status
+}
+
+cmd="${1:-apply}"
+if [[ "$cmd" == "-h" || "$cmd" == "--help" || "$cmd" == "help" ]]; then
+	usage
+	exit 0
+fi
+
+if [[ "$#" -gt 0 ]]; then
+	shift
+else
+	set --
+fi
+
+case "${cmd,,}" in
+apply)
+	apply_profile "$@"
+	;;
+status)
+	status
+	;;
+logs)
+	show_logs
+	;;
+restart)
+	restart_service
+	;;
+sd-max | sd-default | quiet | balanced | sdxl-extreme | max | default | "")
+	apply_profile "$cmd" "$@"
+	;;
+*)
+	echo "Unknown command/profile: $cmd" >&2
+	usage
+	exit 1
+	;;
+esac

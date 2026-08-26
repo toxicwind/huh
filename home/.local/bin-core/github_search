@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+github_search - lightweight GitHub Search API shim.
+
+This CLI wraps GitHub's REST search endpoints so shell workflows can aggregate
+repository/code/issue results without leaving the terminal. Queries follow the
+standard GitHub search syntax, e.g.:
+
+    github_search 'comfyui aesthetic score' --type repos --limit 20
+    github_search 'repo:comfyanonymous/ComfyUI path:custom_nodes aesthetic'
+
+If the `GITHUB_TOKEN` environment variable (or `--token`) is supplied the tool
+uses it to raise rate limits. Results stream as newline-delimited JSON objects
+for easy consumption by `jq` or other tools.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Dict, Iterable, Iterator, List, Optional
+
+
+API_BASE = "https://api.github.com/search"
+SEARCH_TYPES = {
+    "repos": "repositories",
+    "code": "code",
+    "issues": "issues",
+    "commits": "commits",
+    "topics": "topics",
+    "users": "users",
+}
+
+
+class GithubSearchError(RuntimeError):
+    """Raised when the GitHub API returns an error."""
+
+
+def _headers(token: Optional[str], raw: bool, search_type: str) -> Dict[str, str]:
+    hdrs = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "github_search_cli/1.0",
+    }
+    if search_type == "code":
+        hdrs["Accept"] = "application/vnd.github.text-match+json"
+    if raw:
+        hdrs["Accept"] = "application/vnd.github.v3+json"
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+    return hdrs
+
+
+def _request_via_gh(url: str, headers: Dict[str, str]) -> Dict:
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.lstrip("/")
+    endpoint = path if not parsed.query else f"{path}?{parsed.query}"
+
+    cmd = ["gh", "api", endpoint]
+    for key, value in headers.items():
+        cmd.extend(["-H", f"{key}: {value}"])
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip() or proc.stdout.strip()
+        raise GithubSearchError(
+            f"gh api failed (exit {proc.returncode}). {stderr or 'Run `gh auth login` to authenticate.'}"
+        )
+
+    try:
+        return json.loads(proc.stdout or "null")
+    except json.JSONDecodeError as exc:
+        raise GithubSearchError(f"Failed to parse gh api response: {exc}") from exc
+
+
+def _request(url: str, headers: Dict[str, str], use_gh: bool) -> Dict:
+    if use_gh:
+        return _request_via_gh(url, headers)
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            charset = resp.headers.get_content_charset("utf-8")
+            data = resp.read().decode(charset)
+            return json.loads(data)
+    except urllib.error.HTTPError as exc:
+        payload = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(payload).get("message", payload)
+        except json.JSONDecodeError:
+            detail = payload
+        hint = ""
+        if exc.code == 401:
+            hint = " (set GITHUB_TOKEN or use --token for authenticated requests)"
+        raise GithubSearchError(f"GitHub API error {exc.code}: {detail}{hint}") from exc
+    except urllib.error.URLError as exc:
+        raise GithubSearchError(f"GitHub API request failed: {exc}") from exc
+
+
+def _paginate(
+    endpoint: str,
+    headers: Dict[str, str],
+    per_page: int,
+    limit: int,
+    pause: float,
+    use_gh: bool,
+) -> Iterator[Dict]:
+    page = 1
+    delivered = 0
+    while delivered < limit:
+        params = {
+            "per_page": min(per_page, 100),
+            "page": page,
+        }
+        url = f"{endpoint}&{urllib.parse.urlencode(params)}"
+        payload = _request(url, headers, use_gh)
+
+        items = payload.get("items", [])
+        if not items:
+            break
+
+        for item in items:
+            yield item
+            delivered += 1
+            if delivered >= limit:
+                break
+
+        page += 1
+        # GitHub caps search results at 1000 entries.
+        if delivered >= payload.get("total_count", 0) or page > 10:
+            break
+        if pause:
+            time.sleep(pause)
+
+
+def _format_item(item: Dict, search_type: str) -> Dict:
+    base = {
+        "type": search_type,
+    }
+    if search_type == "repositories":
+        base.update(
+            {
+                "full_name": item.get("full_name"),
+                "description": item.get("description"),
+                "stars": item.get("stargazers_count"),
+                "updated_at": item.get("updated_at"),
+                "html_url": item.get("html_url"),
+            }
+        )
+    elif search_type == "code":
+        base.update(
+            {
+                "name": item.get("name"),
+                "path": item.get("path"),
+                "repository": item.get("repository", {}).get("full_name"),
+                "html_url": item.get("html_url"),
+                "score": item.get("score"),
+            }
+        )
+    elif search_type == "issues":
+        base.update(
+            {
+                "title": item.get("title"),
+                "state": item.get("state"),
+                "repository_url": item.get("repository_url"),
+                "html_url": item.get("html_url"),
+                "updated_at": item.get("updated_at"),
+            }
+        )
+    else:
+        base.update(item)
+    return base
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="github_search",
+        description="Search GitHub via REST API and emit newline-delimited JSON results.",
+    )
+    parser.add_argument(
+        "query",
+        help="Search query (GitHub search syntax). Use quotes to include spaces.",
+    )
+    parser.add_argument(
+        "-t",
+        "--type",
+        choices=SEARCH_TYPES.keys(),
+        default="repos",
+        help="Search type endpoint to query (default: repos).",
+    )
+    parser.add_argument(
+        "-l",
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum result items to emit (default: 20, max GitHub allows is 1000).",
+    )
+    parser.add_argument(
+        "-p",
+        "--per-page",
+        type=int,
+        default=50,
+        help="Items per page for API pagination (max 100).",
+    )
+    parser.add_argument(
+        "--sort",
+        help="GitHub API sort field (e.g. stars, updated).",
+    )
+    parser.add_argument(
+        "--order",
+        choices=["asc", "desc"],
+        default="desc",
+        help="Sort order when --sort is provided (default: desc).",
+    )
+    parser.add_argument(
+        "--pause",
+        type=float,
+        default=1.0,
+        help="Seconds to sleep between paginated fetches to avoid rate limits (default: 1).",
+    )
+    parser.add_argument(
+        "--token",
+        help="GitHub token. Overrides GITHUB_TOKEN environment variable if set.",
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Emit raw GitHub payload items instead of condensed fields.",
+    )
+    parser.add_argument(
+        "--gh",
+        action="store_true",
+        help="Use GitHub CLI (`gh api`) even if a token is available.",
+    )
+    parser.add_argument(
+        "--no-gh",
+        action="store_true",
+        help="Disable automatic gh fallback when no token is configured.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    if args.limit <= 0:
+        print("Limit must be > 0", file=sys.stderr)
+        return 1
+
+    search_type = SEARCH_TYPES[args.type]
+    params = {"q": args.query}
+    if args.sort:
+        params["sort"] = args.sort
+        params["order"] = args.order
+
+    endpoint = f"{API_BASE}/{search_type}?{urllib.parse.urlencode(params)}"
+    token = args.token or os.environ.get("GITHUB_TOKEN")
+    headers = _headers(token, args.raw, search_type)
+
+    gh_available = shutil.which("gh") is not None
+    use_gh = False
+    if args.gh:
+        if not gh_available:
+            print("github_search: GitHub CLI 'gh' not found in PATH", file=sys.stderr)
+            return 2
+        use_gh = True
+    elif not token and gh_available and not args.no_gh:
+        use_gh = True
+        print("[github_search] Using gh api (no token detected)", file=sys.stderr)
+
+    if use_gh:
+        headers.pop("Authorization", None)
+
+    try:
+        for item in _paginate(endpoint, headers, args.per_page, args.limit, args.pause, use_gh):
+            output = item if args.raw else _format_item(item, search_type)
+            sys.stdout.write(json.dumps(output, ensure_ascii=False))
+            sys.stdout.write("\n")
+    except GithubSearchError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

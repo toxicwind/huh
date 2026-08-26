@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# gpu-fan-curve — manual NVIDIA fan governor (requires X + Coolbits)
+set -euo pipefail
+
+DISPLAY_ENV=${DISPLAY:-:0}
+FAN_CTRL="[gpu:0]/GPUFanControlState"
+FAN_TARGET="[fan:0]/GPUTargetFanSpeed"
+
+usage() {
+	cat <<'EOT'
+Usage:
+  gpu-fan-curve start [--min 65] [--max 100] [--interval 3] [--curve a,b,c]
+  gpu-fan-curve stop
+
+start: enables manual fan control and applies a piecewise curve
+       (temps <=60 -> min, 70 -> mid, >=80 -> max by default).
+stop : restores automatic fan control.
+EOT
+}
+
+set_fan() {
+	local speed=$1
+	DISPLAY="$DISPLAY_ENV" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+		sudo -n nvidia-settings -a "$FAN_TARGET=$speed" >/dev/null
+}
+
+enable_manual() {
+	DISPLAY="$DISPLAY_ENV" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+		sudo -n nvidia-settings -a "$FAN_CTRL=1" >/dev/null
+}
+
+disable_manual() {
+	DISPLAY="$DISPLAY_ENV" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+		sudo -n nvidia-settings -a "$FAN_CTRL=0" >/dev/null
+}
+
+current_temp() {
+	nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader | tr -d ' '
+}
+
+start_curve() {
+	local min=${1:-65} max=${2:-100} interval=${3:-3} curve=${4:-60,75,85}
+	IFS=',' read -r t_low t_mid t_high <<<"$curve"
+	enable_manual
+	trap 'disable_manual' EXIT
+	while true; do
+		temp=$(current_temp)
+		if ((temp <= t_low)); then
+			target=$min
+		elif ((temp >= t_high)); then
+			target=$max
+		elif ((temp >= t_mid)); then
+			target=$(((max + min * 2) / 3))
+		else
+			target=$(((min + max) / 2))
+		fi
+		set_fan "$target"
+		sleep "$interval"
+	done
+}
+
+command=${1:-}
+if [[ -z $command || $command == "-h" || $command == "--help" ]]; then
+	usage
+	if [[ -z $command ]]; then
+		exit 64
+	else
+		exit 0
+	fi
+fi
+shift || true
+
+case "$command" in
+start)
+	min=65
+	max=100
+	interval=3
+	curve="60,72,80"
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--min)
+			min=${2:?}
+			shift 2
+			;;
+		--max)
+			max=${2:?}
+			shift 2
+			;;
+		--interval)
+			interval=${2:?}
+			shift 2
+			;;
+		--curve)
+			curve=${2:?}
+			shift 2
+			;;
+		*)
+			echo "Unknown option: $1" >&2
+			exit 64
+			;;
+		esac
+	done
+	start_curve "$min" "$max" "$interval" "$curve"
+	;;
+stop)
+	disable_manual
+	;;
+*)
+	usage
+	exit 64
+	;;
+esac

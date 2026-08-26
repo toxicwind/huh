@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Summarize ComfyUI server state (queue, system stats, recent durations, GPU telemetry)."""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+from statistics import mean
+from typing import Any
+import urllib.request
+import urllib.error
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8188
+DEFAULT_LOG = Path.home() / "sd/ComfyUI/user/comfyui_8188.log"
+
+
+def fetch_json(base: str, path: str) -> Any:
+    url = f"{base}{path}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = resp.read()
+        return json.loads(data) if data.strip() else {}
+
+
+def parse_queue(queue: dict[str, Any]) -> dict[str, Any]:
+    pending = queue.get("queue_pending") or []
+    running = queue.get("queue_running") or []
+    summary: dict[str, Any] = {
+        "pending_count": len(pending),
+        "running_count": len(running),
+    }
+    if pending:
+        first = pending[0]
+        summary["first_pending_id"] = first[1]
+        prompt = first[2]
+        steps = 0
+        for node in prompt.values():
+            if isinstance(node, dict) and node.get("class_type") == "KSampler":
+                try:
+                    steps += int(node.get("inputs", {}).get("steps", 0))
+                except (TypeError, ValueError):
+                    continue
+        summary["first_pending_steps"] = steps
+    if running:
+        summary["running_prompt_id"] = running[0][1]
+    return summary
+
+
+def parse_log(log_path: Path, samples: int) -> dict[str, Any]:
+    if not log_path.is_file():
+        return {"log_path": str(log_path), "entries": []}
+    lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    durations: list[float] = []
+    pattern = re.compile(r"Prompt executed in\s+(\d+\.\d+)")
+    for line in reversed(lines):
+        match = pattern.search(line)
+        if match:
+            durations.append(float(match.group(1)))
+            if len(durations) >= samples:
+                break
+    durations.reverse()
+    return {
+        "log_path": str(log_path),
+        "entries": durations,
+        "mean": mean(durations) if durations else None,
+    }
+
+
+def query_nvidia() -> dict[str, Any]:
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,temperature.gpu,fan.speed,power.draw,power.limit,clocks.sm",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        raw = subprocess.check_output(cmd, text=True, timeout=5)
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return {}
+    parts = raw.strip().split(",")
+    if len(parts) < 6:
+        return {}
+    return {
+        "gpu_index": int(parts[0].strip()),
+        "temp_c": float(parts[1].strip()),
+        "fan_pct": float(parts[2].strip()),
+        "power_w": float(parts[3].strip()),
+        "power_limit_w": float(parts[4].strip()),
+        "sm_mhz": float(parts[5].strip()),
+    }
+
+
+def format_summary(queue_info: dict[str, Any], log_info: dict[str, Any], gpu_info: dict[str, Any]) -> str:
+    lines = []
+    lines.append("Queue: {pending_count} pending, {running_count} running".format(**queue_info))
+    if "first_pending_id" in queue_info:
+        lines.append(
+            f"First pending: {queue_info['first_pending_id']} (steps≈{queue_info.get('first_pending_steps', 'n/a')})"
+        )
+    if "running_prompt_id" in queue_info:
+        lines.append(f"Running prompt: {queue_info['running_prompt_id']}")
+    if log_info.get("entries"):
+        lines.append(
+            f"Recent durations (s): {', '.join(f'{d:.2f}' for d in log_info['entries'])}"
+        )
+        if log_info.get("mean"):
+            lines.append(f"Mean of last {len(log_info['entries'])}: {log_info['mean']:.2f}s")
+    else:
+        lines.append(f"No prompt durations found in {log_info['log_path']}")
+    if gpu_info:
+        lines.append(
+            "GPU now: {power_w:.0f}/{power_limit_w:.0f} W, {temp_c:.0f}°C, fan {fan_pct:.0f}%, SM {sm_mhz:.0f} MHz".format(
+                **gpu_info
+            )
+        )
+    return "\n".join(lines)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Summarize ComfyUI runtime state")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
+    parser.add_argument("--samples", type=int, default=5, help="Number of recent prompt durations to show")
+    parser.add_argument("--json", action="store_true", help="Emit raw JSON summary")
+    args = parser.parse_args()
+
+    base = f"http://{args.host}:{args.port}"
+    try:
+        queue_data = fetch_json(base, "/queue")
+        stats_data = fetch_json(base, "/system_stats")
+    except urllib.error.URLError as err:
+        raise SystemExit(f"Failed to reach ComfyUI API: {err}") from err
+
+    queue_info = parse_queue(queue_data)
+    log_info = parse_log(args.log, args.samples)
+    gpu_info = query_nvidia()
+
+    summary = {
+        "host": args.host,
+        "port": args.port,
+        "queue": queue_info,
+        "system": stats_data.get("system", {}),
+        "devices": stats_data.get("devices", {}),
+        "log": log_info,
+        "gpu_now": gpu_info,
+    }
+
+    if args.json:
+        json.dump(summary, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print(format_summary(queue_info, log_info, gpu_info))
+
+
+if __name__ == "__main__":
+    main()

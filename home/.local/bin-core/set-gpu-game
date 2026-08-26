@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [ $# -lt 1 ]; then
+	echo "Usage: set-gpu-game <PL_WATTS> [GPU_INDEX]"
+	exit 2
+fi
+PL="$1"
+GPU="${2:-${GPU:-0}}"
+echo "[*] Gaming mode: disabling sd-quiet and setting PL=${PL}W on GPU ${GPU}"
+sudo systemctl disable --now sd-quiet.service >/dev/null 2>&1 || true
+sudo nvidia-smi -pm 1 >/dev/null 2>&1 || true
+sudo nvidia-smi -i "$GPU" -pl "$PL"
+DEF="$(LC_ALL=C nvidia-smi --query-gpu=power.default_limit --format=csv,noheader,nounits -i "$GPU" | head -n1)"
+echo "[✓] Gaming PL applied. Default PL=${DEF}W. To revert: set-gpu-sd"

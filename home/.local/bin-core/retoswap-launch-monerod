@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MONEROD_BIN="${HOME}/.local/bin/monerod"
+DATA_DIR="${HOME}/work-tor/monero"
+SOCKS_ENDPOINT="127.0.0.1:9050"
+PRIORITY_FILE="${RETOSWAP_MONEROD_PRIORITY_FILE:-}"
+
+ARGS=(
+	"--data-dir=${DATA_DIR}"
+	"--rpc-bind-ip=127.0.0.1"
+	"--rpc-bind-port=18081"
+	"--rpc-restricted-bind-ip=127.0.0.1"
+	"--rpc-restricted-bind-port=18089"
+	"--p2p-bind-ip=127.0.0.1"
+	"--p2p-bind-port=18080"
+	"--hide-my-port"
+	"--out-peers=16"
+	"--in-peers=0"
+	"--proxy=${SOCKS_ENDPOINT}"
+	"--prune-blockchain"
+	"--no-igd"
+	"--enable-dns-blocklist"
+	"--non-interactive"
+)
+
+if [[ -n "$PRIORITY_FILE" && -r "$PRIORITY_FILE" ]]; then
+	while IFS= read -r node; do
+		[[ -n "$node" ]] || continue
+		ARGS+=("--add-priority-node=${node}")
+	done <"$PRIORITY_FILE"
+fi
+
+exec "$MONEROD_BIN" "${ARGS[@]}"

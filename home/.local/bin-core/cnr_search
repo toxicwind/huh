@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""
+cnr_search - Comfy Node Registry CLI shim (cache-aware).
+
+Reuses ComfyUI-Manager's registry helper from inside the micromamba
+`comfyui-py312` environment but adds a lightweight daily cache stored under the
+ComfyUI root (`.cache/cnr_search/registry.json`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Optional
+
+API_BASE = "https://api.comfy.org"
+DEFAULT_ROOT = os.environ.get("COMFYUI_ROOT", os.getcwd())
+CACHE_SUBDIR = os.path.join(".cache", "cnr_search")
+CACHE_FILENAME = "registry.json"
+CACHE_TTL = timedelta(hours=24)
+
+
+def _cache_paths(root: str) -> tuple[str, str]:
+    cache_dir = os.path.join(root, CACHE_SUBDIR)
+    cache_file = os.path.join(cache_dir, CACHE_FILENAME)
+    return cache_dir, cache_file
+
+
+def _load_cached_registry(root: str, allow_stale: bool) -> Optional[List[Dict[str, Any]]]:
+    _, cache_file = _cache_paths(root)
+    if not os.path.isfile(cache_file):
+        return None
+
+    try:
+        with open(cache_file, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, list):
+        return None
+
+    fetched_at = payload.get("fetched_at")
+    if fetched_at:
+        try:
+            timestamp = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+        except ValueError:
+            timestamp = None
+    else:
+        timestamp = None
+
+    if timestamp is None:
+        return nodes if allow_stale else None
+
+    age = datetime.now(timezone.utc) - timestamp
+    if age <= CACHE_TTL or allow_stale:
+        return nodes
+
+    return None
+
+
+def _store_cached_registry(root: str, nodes: List[Dict[str, Any]]) -> None:
+    cache_dir, cache_file = _cache_paths(root)
+    os.makedirs(cache_dir, exist_ok=True)
+    payload = {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "nodes": nodes,
+    }
+    with open(cache_file, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+
+
+def _fetch_registry_via_manager(root: str, refresh: bool, dont_wait: bool) -> List[Dict[str, Any]]:
+    root = os.path.abspath(root)
+    script = """
+import asyncio
+import json
+import os
+import sys
+
+root = os.path.abspath(sys.argv[1])
+refresh = sys.argv[2] == "1"
+dont_wait = sys.argv[3] == "1"
+manager_glob = os.path.join(root, "custom_nodes", "ComfyUI-Manager", "glob")
+if not os.path.isdir(manager_glob):
+    print("[]")
+    raise SystemExit(0)
+
+cache_root = os.path.join(root, "custom_nodes", "ComfyUI-Manager", ".cache")
+os.makedirs(cache_root, exist_ok=True)
+
+sys.path.insert(0, root)
+sys.path.insert(0, manager_glob)
+
+import cnr_utils  # type: ignore
+
+async def main():
+    data = await cnr_utils.get_cnr_data(cache_mode=not refresh, dont_wait=dont_wait)
+    if isinstance(data, dict):
+        data = data.get("nodes", [])
+    print(json.dumps(data, ensure_ascii=False))
+
+asyncio.run(main())
+"""
+
+    cmd = [
+        "micromamba",
+        "run",
+        "-n",
+        "comfyui-py312",
+        "python",
+        "-",
+        root,
+        "1" if refresh else "0",
+        "1" if dont_wait else "0",
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        print(f"Failed to execute micromamba: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    if proc.returncode != 0:
+        message = proc.stderr.strip() or proc.stdout.strip()
+        print(message or "Unknown micromamba error", file=sys.stderr)
+        sys.exit(proc.returncode)
+
+    output = proc.stdout.strip()
+    if not output:
+        return []
+
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        print("Unable to parse registry output:", file=sys.stderr)
+        print(output, file=sys.stderr)
+        sys.exit(2)
+
+
+def _load_registry(root: str, refresh: bool, dont_wait: bool) -> List[Dict[str, Any]]:
+    allow_stale = dont_wait and not refresh
+    if not refresh:
+        cached = _load_cached_registry(root, allow_stale=allow_stale)
+        if cached is not None:
+            return cached
+
+    nodes = _fetch_registry_via_manager(root, refresh=refresh, dont_wait=dont_wait)
+    if nodes:
+        _store_cached_registry(root, nodes)
+        return nodes
+
+    # Fallback to stale cache if fetch failed but data exists.
+    cached = _load_cached_registry(root, allow_stale=True)
+    if cached is not None:
+        return cached
+
+    return []
+
+
+def _node_text(node: Dict[str, Any]) -> str:
+    publisher = node.get("publisher") or {}
+    tags = node.get("tags") or []
+    parts = [
+        node.get("id", ""),
+        node.get("name", ""),
+        node.get("description", ""),
+        node.get("author", ""),
+        node.get("repository", ""),
+        " ".join(tags),
+        publisher.get("name", ""),
+        publisher.get("description", ""),
+    ]
+    return " ".join(str(p) for p in parts if p).lower()
+
+
+def _filter_nodes(nodes: Iterable[Dict[str, Any]], query_tokens: List[str], regex: bool) -> List[Dict[str, Any]]:
+    text = " ".join(query_tokens)
+    if regex:
+        try:
+            pattern = re.compile(text, re.IGNORECASE)
+        except re.error as exc:
+            print(f"Invalid regex: {exc}", file=sys.stderr)
+            sys.exit(2)
+        return [node for node in nodes if pattern.search(_node_text(node))]
+
+    tokens = [tok.lower() for tok in query_tokens if tok]
+    if not tokens:
+        print("Search query cannot be empty.", file=sys.stderr)
+        sys.exit(2)
+
+    matches = []
+    for node in nodes:
+        haystack = _node_text(node)
+        if all(token in haystack for token in tokens):
+            matches.append(node)
+    return matches
+
+
+def _print_table(nodes: Iterable[Dict[str, Any]]) -> None:
+    nodes = list(nodes)
+    if not nodes:
+        print("No matches found.")
+        return
+
+    headers = ["id", "name", "repository", "description"]
+    rows = []
+    for node in nodes:
+        repo = node.get("repository") or ""
+        description = textwrap.shorten(node.get("description") or "", width=100, placeholder="…")
+        rows.append(
+            [
+                str(node.get("id", "")),
+                str(node.get("name", "")),
+                repo,
+                description,
+            ]
+        )
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+
+    def _fmt(row: Iterable[str]) -> str:
+        return " | ".join(str(cell).ljust(widths[idx]) for idx, cell in enumerate(row))
+
+    print(_fmt(headers))
+    print("-+-".join("-" * w for w in widths))
+    for row in rows:
+        print(_fmt(row))
+
+
+def _request(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    url = f"{API_BASE}{path}"
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "cnr_search_cli/2.0",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            charset = resp.headers.get_content_charset("utf-8")
+            data = resp.read().decode(charset)
+            return json.loads(data)
+    except urllib.error.HTTPError as exc:
+        payload = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(payload).get("message", payload)
+        except json.JSONDecodeError:
+            detail = payload or exc.reason
+        print(f"CNR API error {exc.code}: {detail}", file=sys.stderr)
+        sys.exit(2)
+    except urllib.error.URLError as exc:
+        print(f"CNR API request failed: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    nodes = _load_registry(args.root, refresh=args.refresh, dont_wait=args.dont_wait)
+    filtered = _filter_nodes(nodes, args.query, args.regex)
+
+    if args.limit > 0:
+        filtered = filtered[: args.limit]
+
+    if args.format == "json":
+        indent = 2 if args.pretty else None
+        json.dump(filtered, sys.stdout, ensure_ascii=False, indent=indent)
+        sys.stdout.write("\n")
+        return 0
+
+    if args.format == "table":
+        _print_table(filtered)
+        return 0
+
+    return 0
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    payload = _request(f"/nodes/{args.node_id}", {})
+    json.dump(payload, sys.stdout, ensure_ascii=False, indent=args.indent)
+    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_versions(args: argparse.Namespace) -> int:
+    params = {
+        "statuses": "NodeVersionStatusActive",
+    }
+    payload = _request(f"/nodes/{args.node_id}/versions", params)
+    versions = payload.get("node_versions", payload)
+    for version in versions:
+        json.dump(version, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+    return 0
+
+
+def cmd_precache(args: argparse.Namespace) -> int:
+    nodes = _load_registry(args.root, refresh=args.refresh, dont_wait=args.dont_wait)
+    print(f"Cached {len(nodes)} nodes at {args.root}")
+    return 0
+
+
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="cnr_search", description="Comfy Node Registry shim.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_search = sub.add_parser("search", help="Search nodes (cached via ComfyUI-Manager).")
+    p_search.add_argument("query", nargs="+", help="Search query string (one or more terms).")
+    p_search.add_argument("--limit", type=int, default=0, help="Maximum matches to emit (0 = unlimited).")
+    p_search.add_argument("--format", choices=["json", "table"], default="json", help="Output format.")
+    p_search.add_argument("--pretty", action="store_true", help="Pretty print JSON output.")
+    p_search.add_argument("--regex", action="store_true", help="Treat the query as a regular expression.")
+    p_search.add_argument("--refresh", action="store_true", help="Ignore cache and refetch the registry (slow).")
+    p_search.add_argument("--dont-wait", action="store_true", help="Return cached data immediately if fresh fetch is in progress.")
+    p_search.add_argument("--root", default=DEFAULT_ROOT, help="ComfyUI root directory (defaults to cwd or $COMFYUI_ROOT).")
+    p_search.set_defaults(func=cmd_search)
+
+    p_precache = sub.add_parser("precache", help="Refresh the registry cache without printing results.")
+    p_precache.add_argument("--root", default=DEFAULT_ROOT, help="ComfyUI root directory (defaults to cwd or $COMFYUI_ROOT).")
+    p_precache.add_argument("--refresh", action="store_true", help="Force download even if cache is fresh.")
+    p_precache.add_argument("--dont-wait", action="store_true", help="Return cached data immediately if refresh is in progress.")
+    p_precache.set_defaults(func=cmd_precache)
+
+    p_info = sub.add_parser("info", help="Get node metadata by ID.")
+    p_info.add_argument("node_id", help="Node ID from the registry.")
+    p_info.add_argument("--indent", type=int, help="Indent JSON output.")
+    p_info.set_defaults(func=cmd_info)
+
+    p_versions = sub.add_parser("versions", help="List node versions.")
+    p_versions.add_argument("node_id")
+    p_versions.set_defaults(func=cmd_versions)
+
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    known = {"search", "info", "versions", "precache"}
+    if argv and not argv[0].startswith("-") and argv[0] not in known:
+        argv = ["search", *argv]
+
+    parser = make_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

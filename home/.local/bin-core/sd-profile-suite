@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Curate sd-quiet profiles (rush/flow/hush) based on queue depth."""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import urllib.request
+import urllib.error
+
+PROFILES = {
+    "rush": {
+        "file": "sd-rush",
+        "desc": "Full-send queue burner (100-105% power, fan 70-97%)",
+        "fan": 88,
+    },
+    "flow": {
+        "file": "sd-flow",
+        "desc": "Balanced throughput/noise (92-100% power, fan 55-85%)",
+        "fan": 78,
+    },
+    "hush": {
+        "file": "sd-hush",
+        "desc": "Acoustics-first (82-90% power, fan 40-70%)",
+        "fan": 68,
+    },
+}
+
+QUEUE_THRESHOLDS = {
+    "rush": 400,
+    "flow": 120,
+}
+
+
+def fetch_queue(host: str, port: int) -> int:
+    url = f"http://{host}:{port}/queue"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = resp.read()
+        obj = json.loads(data) if data.strip() else {}
+    return len(obj.get("queue_pending") or [])
+
+
+def recommend_profile(pending: int) -> str:
+    if pending >= QUEUE_THRESHOLDS["rush"]:
+        return "rush"
+    if pending >= QUEUE_THRESHOLDS["flow"]:
+        return "flow"
+    return "hush"
+
+
+def apply_profile(name: str, fan_override: int | None, manage_clocks: bool) -> None:
+    profile = PROFILES[name]
+    cmd = ["gpu-profile", "apply", profile["file"]]
+    subprocess.run(cmd, check=True)
+    if manage_clocks:
+        if name == "rush":
+            subprocess.run(["gpu-clocks", "lock"], check=True)
+        else:
+            subprocess.run(["gpu-clocks", "reset"], check=True)
+    if fan_override is None:
+        fan_override = profile["fan"]
+    subprocess.run(["hb-fan-target", str(fan_override)], check=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8188)
+    parser.add_argument("--apply", choices=PROFILES.keys())
+    parser.add_argument("--fan", type=int, help="Override fan percent when applying")
+    parser.add_argument("--manage-clocks", action="store_true", help="Lock clocks for rush, reset otherwise")
+    args = parser.parse_args()
+
+    pending = fetch_queue(args.host, args.port)
+    suggestion = recommend_profile(pending)
+    print(f"Pending jobs: {pending}")
+    for key, profile in PROFILES.items():
+        marker = "*" if key == suggestion else " "
+        print(f"[{marker}] {key:<5} → {profile['file']} :: {profile['desc']}")
+    if args.apply:
+        print(f"Applying {args.apply} profile...")
+        apply_profile(args.apply, args.fan, args.manage_clocks)
+
+
+if __name__ == "__main__":
+    main()

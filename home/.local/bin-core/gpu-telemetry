@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Enhanced NVIDIA telemetry sampler with summary + streaming modes."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import statistics
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+FIELD_MAP = [
+    ("gpu_index", int),
+    ("gpu_name", str),
+    ("temp_c", float),
+    ("fan_pct", float),
+    ("util_gpu_pct", float),
+    ("util_mem_pct", float),
+    ("power_w", float),
+    ("power_limit_w", float),
+    ("vram_used_mib", float),
+    ("vram_total_mib", float),
+    ("sm_clock_mhz", float),
+    ("mem_clock_mhz", float),
+    ("graphics_clock_mhz", float),
+]
+
+QUERY = [
+    "nvidia-smi",
+    "--query-gpu="
+    + ",".join(
+        [
+            "index",
+            "name",
+            "temperature.gpu",
+            "fan.speed",
+            "utilization.gpu",
+            "utilization.memory",
+            "power.draw",
+            "power.limit",
+            "memory.used",
+            "memory.total",
+            "clocks.sm",
+            "clocks.mem",
+            "clocks.current.graphics",
+        ]
+    ),
+    "--format=csv,noheader,nounits",
+]
+
+NUMERIC_KEYS = {
+    "temp_c",
+    "fan_pct",
+    "util_gpu_pct",
+    "util_mem_pct",
+    "power_w",
+    "power_limit_w",
+    "vram_used_mib",
+    "vram_total_mib",
+    "sm_clock_mhz",
+    "mem_clock_mhz",
+    "graphics_clock_mhz",
+}
+
+
+def sample_once(gpu: int) -> Dict[str, Any]:
+    proc = subprocess.run(
+        QUERY + [f"-i={gpu}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    reader = csv.reader(line for line in proc.stdout.strip().splitlines())
+    fields = next(reader)
+    result: Dict[str, Any] = {"timestamp": time.time()}
+    for (key, caster), raw in zip(FIELD_MAP, fields):
+        value = raw.strip()
+        try:
+            result[key] = caster(value)
+        except ValueError:
+            result[key] = value
+    return result
+
+
+def aggregate(samples: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    summary: Dict[str, Dict[str, float]] = {}
+    for key in NUMERIC_KEYS:
+        values = [float(sample[key]) for sample in samples if key in sample]
+        if not values:
+            continue
+        stats = {
+            "min": min(values),
+            "mean": statistics.fmean(values),
+            "max": max(values),
+        }
+        if len(values) > 1:
+            stats["stdev"] = statistics.pstdev(values)
+            try:
+                stats["p95"] = statistics.quantiles(values, n=20)[18]
+            except (statistics.StatisticsError, IndexError):
+                pass
+        summary[key] = stats
+    return summary
+
+
+def print_summary(summary: Dict[str, Dict[str, float]]) -> None:
+    headers = ("metric", "min", "mean", "max", "stdev", "p95")
+    print(" | ".join(f"{h:>12}" for h in headers))
+    print("-" * 78)
+    for metric, stats in summary.items():
+        row = [
+            metric,
+            f"{stats.get('min', float('nan')):8.2f}",
+            f"{stats.get('mean', float('nan')):8.2f}",
+            f"{stats.get('max', float('nan')):8.2f}",
+            f"{stats.get('stdev', 0.0):8.2f}",
+            f"{stats.get('p95', 0.0):8.2f}",
+        ]
+        print(" | ".join(row))
+
+
+def format_stream(sample: Dict[str, Any], *, show_header: bool) -> None:
+    if show_header:
+        print("timestamp          tempC fan% util% powerW vram_used/total (MiB) smMHz memMHz")
+    ts = time.strftime("%H:%M:%S", time.localtime(sample["timestamp"]))
+    print(
+        f"{ts}  {sample['temp_c']:5.1f}  {sample['fan_pct']:4.0f}  "
+        f"{sample['util_gpu_pct']:4.0f}  {sample['power_w']:6.1f}  "
+        f"{sample['vram_used_mib']:6.0f}/{sample['vram_total_mib']:6.0f}  "
+        f"{sample['sm_clock_mhz']:5.0f}  {sample['mem_clock_mhz']:5.0f}"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--gpu", type=int, default=0, help="GPU index to query")
+    parser.add_argument("--interval", type=float, default=2.0, help="Seconds between samples")
+    parser.add_argument("--samples", type=int, default=30, help="Sample count for summary mode")
+    parser.add_argument(
+        "--mode",
+        choices={"summary", "stream"},
+        default="summary",
+        help="summary: collect N samples then report stats; stream: live output",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
+    parser.add_argument("--output", type=Path, help="Optional path to write JSON output")
+    args = parser.parse_args()
+
+    if args.mode == "stream":
+        header_printed = False
+        try:
+            while True:
+                sample = sample_once(args.gpu)
+                if args.json:
+                    payload = json.dumps(sample)
+                    if args.output:
+                        with args.output.open("a", encoding="utf-8") as fh:
+                            fh.write(payload + "\n")
+                    print(payload)
+                else:
+                    format_stream(sample, show_header=not header_printed)
+                    header_printed = True
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            return
+
+    samples = []
+    for _ in range(args.samples):
+        samples.append(sample_once(args.gpu))
+        time.sleep(args.interval)
+
+    summary = aggregate(samples)
+    if args.json:
+        payload = json.dumps({"summary": summary, "samples": samples}, indent=2)
+        if args.output:
+            args.output.write_text(payload)
+        print(payload)
+    else:
+        print_summary(summary)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# hb-run — tmux one-shot runner with timeout + captured output
+# usage: hb-run SESSION "command ..." [timeout_sec]
+
+set -euo pipefail
+
+usage() {
+	cat <<'EOT'
+Usage: hb-run SESSION "command" [timeout_sec]
+Runs COMMAND inside a tmux session on socket ${HB_RUN_SOCKET:-hb}, captures the
+pane output, prints it, and exits with the command's status (124 if unknown).
+EOT
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" || $# -lt 2 ]]; then
+	usage
+	if [[ $# -lt 2 && ${1:-} != "-h" && ${1:-} != "--help" ]]; then
+		exit 1
+	else
+		exit 0
+	fi
+fi
+
+session=$1
+shift
+cmd=$1
+shift
+timeout_sec=${1:-8}
+
+socket=${HB_RUN_SOCKET:-hb}
+width=${HB_RUN_WIDTH:-200}
+height=${HB_RUN_HEIGHT:-50}
+
+tmux -L "$socket" start-server
+if ! tmux -L "$socket" has-session -t "$session" 2>/dev/null; then
+	tmux -L "$socket" new-session -d -s "$session" -x "$width" -y "$height"
+fi
+
+window_id=$(tmux -L "$socket" new-window -P -F "#{window_index}" -t "$session" -n hb-run)
+pane_target="$session:$window_id.0"
+chan="hb_${session}_$(date +%s)"
+
+payload="set -euo pipefail; ${cmd}; ec=\$?; echo __HB_RC__:\$ec; tmux wait-for -L -S ${chan}"
+
+timeout "$timeout_sec" tmux -L "$socket" send-keys -t "$pane_target" "bash -lc '$payload'" C-m
+
+timeout "$timeout_sec" tmux -L "$socket" wait-for "$chan"
+
+output=$(tmux -L "$socket" capture-pane -pt "$pane_target")
+printf '%s\n' "$output"
+
+rc=$(printf '%s' "$output" | sed -n 's/^__HB_RC__://p' | tail -1)
+if [[ -z ${rc:-} ]]; then
+	rc=124
+fi
+
+tmux -L "$socket" kill-window -t "$session:$window_id" || true
+exit "$rc"

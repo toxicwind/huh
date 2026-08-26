@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# gpu-noise-watch — log fan % + RPM + temps for diagnostics
+set -euo pipefail
+LOG=${1:-$HOME/logs/gpu-fan.csv}
+mkdir -p "$(dirname "$LOG")"
+print_header=0
+[[ -f $LOG ]] || print_header=1
+{
+	if ((print_header)); then
+		echo "timestamp,temp_c,fan_pct,fan_rpm,power_w,util_pct"
+	fi
+	while true; do
+		now=$(date -Is)
+		read -r temp fan power util < <(nvidia-smi --query-gpu=temperature.gpu,fan.speed,power.draw,utilization.gpu --format=csv,noheader,nounits | tr ',' ' ')
+		rpm=$(DISPLAY=${DISPLAY:-:0} XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority} nvidia-settings -q [fan:0]/GPUCurrentFanSpeedRPM -t 2>/dev/null || echo 0)
+		echo "$now,$temp,$fan,$rpm,$power,$util"
+		sleep 5
+	done
+} >>"$LOG"

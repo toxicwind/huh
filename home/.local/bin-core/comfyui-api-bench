@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""
+Benchmark ComfyUI workflows via the HTTP API and emit latency plus it/s metrics.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import random
+import statistics
+import time
+import urllib.error
+import urllib.request
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+SAMPLER_NODES = {
+    "KSampler",
+    "KSamplerAdvanced",
+    "SamplerCustom",
+    "SamplerCustomAdvanced",
+}
+
+
+@dataclass
+class RunMetrics:
+    prompt_id: str
+    duration_wall: float
+    duration_backend: float | None
+    images: int
+    steps_per_image: int
+
+    @property
+    def total_steps(self) -> int:
+        return self.steps_per_image * max(self.images, 0)
+
+    @property
+    def iterations_per_second(self) -> float | None:
+        total = self.total_steps
+        if total <= 0:
+            return None
+        base = self.duration_backend or self.duration_wall
+        if base <= 0:
+            return None
+        return total / base
+
+
+def http_json(url: str, data: dict | None = None, timeout: float = 900.0) -> dict:
+    headers = {"Content-Type": "application/json"}
+    payload = None
+    if data is not None:
+        payload = json.dumps(data).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        if not raw.strip():
+            return {}
+        return json.loads(raw)
+
+
+def mutate_seeds(prompt: dict[str, Any], seed: int | None) -> None:
+    rng = random.Random(seed if seed is not None else time.time_ns())
+    for node in prompt.values():
+        if isinstance(node, dict):
+            inputs = node.get("inputs")
+            if isinstance(inputs, dict) and "seed" in inputs:
+                inputs["seed"] = rng.randrange(1 << 63)
+
+
+def count_images(history_entry: dict[str, Any]) -> int:
+    outputs = history_entry.get("outputs", {})
+    count = 0
+    for node_out in outputs.values():
+        if isinstance(node_out, dict):
+            images = node_out.get("images", [])
+            if isinstance(images, list):
+                count += len(images)
+    return count
+
+
+def steps_per_image(prompt: dict[str, Any]) -> int:
+    total = 0
+    for node in prompt.values():
+        if not isinstance(node, dict):
+            continue
+        if node.get("class_type") not in SAMPLER_NODES:
+            continue
+        steps = node.get("inputs", {}).get("steps")
+        if isinstance(steps, (int, float)):
+            total += int(steps)
+    return total
+
+
+def extract_backend_duration(history_entry: dict[str, Any]) -> float | None:
+    status = history_entry.get("status") or {}
+    messages = status.get("messages") or []
+    start_ts = None
+    end_ts = None
+    for entry in messages:
+        if not isinstance(entry, list) or len(entry) != 2:
+            continue
+        event, payload = entry
+        if not isinstance(payload, dict):
+            continue
+        ts = payload.get("timestamp")
+        if not isinstance(ts, (int, float)):
+            continue
+        if event == "execution_start":
+            start_ts = ts
+        elif event == "execution_success":
+            end_ts = ts
+    if start_ts is None or end_ts is None:
+        return None
+    return (end_ts - start_ts) / 1000.0
+
+
+def wait_for_prompt(
+    history_url: str,
+    prompt_id: str,
+    poll: float,
+    timeout: float,
+) -> dict[str, Any]:
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        time.sleep(poll)
+        try:
+            history = http_json(f"{history_url}/{prompt_id}")
+        except urllib.error.HTTPError as err:
+            if err.code == 404:
+                continue
+            raise
+        entry = history.get(prompt_id)
+        if not entry:
+            continue
+        status = entry.get("status", {})
+        state = str(
+            status.get("status") or status.get("status_str") or ""
+        ).lower()
+        if state in {"error", "failed"}:
+            raise SystemExit(f"Prompt {prompt_id} failed: {status}")
+        if state in {"success", "completed"} or entry.get("outputs"):
+            return entry
+    raise TimeoutError(f"Timed out waiting for prompt {prompt_id}")
+
+
+def request_free_memory(free_url: str, unload: bool) -> None:
+    http_json(free_url, {"free_memory": True, "unload_models": unload})
+
+
+def bench_once(
+    submit_url: str,
+    history_url: str,
+    prompt_template: dict[str, Any],
+    client_id: str,
+    poll: float,
+    timeout: float,
+    seed: int | None,
+) -> RunMetrics:
+    prompt = copy.deepcopy(prompt_template)
+    mutate_seeds(prompt, seed)
+    payload = {"prompt": prompt, "client_id": client_id}
+
+    try:
+        submission = http_json(submit_url, payload)
+    except urllib.error.HTTPError as err:
+        raise SystemExit(f"HTTP error {err.code}: {err.read().decode()}") from err
+    except urllib.error.URLError as err:
+        raise SystemExit(f"Failed to reach ComfyUI API: {err}") from err
+
+    prompt_id = submission.get("prompt_id")
+    if not prompt_id:
+        raise SystemExit(f"Unexpected response from /prompt: {submission}")
+
+    started = time.perf_counter()
+    history_entry = wait_for_prompt(history_url, prompt_id, poll, timeout)
+    duration_wall = time.perf_counter() - started
+
+    metrics = RunMetrics(
+        prompt_id=prompt_id,
+        duration_wall=duration_wall,
+        duration_backend=extract_backend_duration(history_entry),
+        images=count_images(history_entry),
+        steps_per_image=steps_per_image(prompt),
+    )
+
+    return metrics
+
+
+def print_table(results: list[RunMetrics]) -> None:
+    header = f"{'Run':>3} {'Prompt ID':36} {'Wall(s)':>8} {'Backend(s)':>10} {'Images':>6} {'Steps/img':>9} {'Steps':>9} {'it/s':>8}"
+    print(header)
+    print("-" * len(header))
+    for idx, r in enumerate(results, start=1):
+        backend = f"{r.duration_backend:.2f}" if r.duration_backend else "-"
+        itps = r.iterations_per_second
+        itps_str = f"{itps:.2f}" if itps else "-"
+        print(
+            f"{idx:>3} {r.prompt_id} {r.duration_wall:8.2f} {backend:>10} "
+            f"{r.images:6d} {r.steps_per_image:9d} {r.total_steps:9d} {itps_str:>8}"
+        )
+
+
+def summarize(results: list[RunMetrics], label: str, extractor) -> None:
+    values = [extractor(r) for r in results if extractor(r) is not None]
+    if not values:
+        return
+    avg = statistics.mean(values)
+    median = statistics.median(values)
+    spread = statistics.stdev(values) if len(values) > 1 else 0.0
+    print(
+        f"{label}: avg={avg:.3f} median={median:.3f} "
+        f"stdev={spread:.3f} min={min(values):.3f} max={max(values):.3f}"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--workflow",
+        default="/home/toxic/Downloads/Mainfix.json",
+        type=Path,
+        help="Workflow JSON to enqueue (default: %(default)s)",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="ComfyUI API host")
+    parser.add_argument("--port", default=8188, type=int, help="ComfyUI API port")
+    parser.add_argument("--client-id", default=None, help="Optional fixed client id prefix")
+    parser.add_argument("--poll", default=0.5, type=float, help="Poll interval seconds")
+    parser.add_argument("--timeout", default=1800.0, type=float, help="Per run timeout seconds")
+    parser.add_argument("--seed", default=None, type=int, help="Base seed (offset per run); default random")
+    parser.add_argument("--runs", default=3, type=int, help="Number of measured runs")
+    parser.add_argument("--warmup", default=0, type=int, help="Warm-up runs (not recorded)")
+    parser.add_argument("--free-memory", action="store_true", help="Call /free between runs to clear caches")
+    parser.add_argument("--unload-models", action="store_true", help="Unload models as part of /free")
+    parser.add_argument("--cleanup", action="store_true", help="Delete history entries after completion")
+    args = parser.parse_args()
+
+    if args.runs < 1:
+        raise SystemExit("--runs must be >= 1")
+    if args.warmup < 0:
+        raise SystemExit("--warmup must be >= 0")
+    if not args.workflow.exists():
+        raise SystemExit(f"Workflow file not found: {args.workflow}")
+
+    prompt_template = json.loads(args.workflow.read_text())
+    base_steps = steps_per_image(prompt_template)
+    if base_steps <= 0:
+        print("[!] Unable to determine sampler steps from workflow; it/s will be omitted.")
+
+    server = f"http://{args.host}:{args.port}"
+    submit_url = f"{server}/prompt"
+    history_url = f"{server}/history"
+    free_url = f"{server}/free"
+    client_base = args.client_id or f"bench-{uuid.uuid4()}"
+
+    total_runs = args.warmup + args.runs
+    results: list[RunMetrics] = []
+
+    for idx in range(total_runs):
+        run_seed = None
+        if args.seed is not None:
+            run_seed = args.seed + idx
+
+        client_id = f"{client_base}-r{idx:02d}"
+
+        if idx > 0 and args.free_memory:
+            request_free_memory(free_url, args.unload_models)
+            time.sleep(1.0)
+
+        is_warmup = idx < args.warmup
+        label = f"warmup {idx + 1}/{args.warmup}" if is_warmup else f"run {idx - args.warmup + 1}/{args.runs}"
+        print(f"[+] Starting {label} (client_id={client_id})")
+
+        metrics = bench_once(
+            submit_url=submit_url,
+            history_url=history_url,
+            prompt_template=prompt_template,
+            client_id=client_id,
+            poll=args.poll,
+            timeout=args.timeout,
+            seed=run_seed,
+        )
+
+        duration_str = f"{metrics.duration_wall:.2f}s"
+        if metrics.duration_backend:
+            duration_str += f" (backend {metrics.duration_backend:.2f}s)"
+        print(f"[✓] {label} completed in {duration_str} → {metrics.images} image(s)")
+
+        if not is_warmup:
+            results.append(metrics)
+
+        if args.cleanup:
+            http_json(history_url, {"delete": [metrics.prompt_id]})
+
+    if not results:
+        print("[!] No measured runs recorded.")
+        return
+
+    print_table(results)
+    summarize(results, "Wall time (s)", lambda r: r.duration_wall)
+    summarize(results, "Backend time (s)", lambda r: r.duration_backend)
+    summarize(results, "it/s", lambda r: r.iterations_per_second)
+
+
+if __name__ == "__main__":
+    main()

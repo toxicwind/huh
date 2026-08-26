@@ -1,0 +1,49 @@
+# Editors
+*.swp
+*.swo
+*.tmp
+*.bak
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Backups
+home/**/*.bak
+home/**/*.old
+home/**/logs/
+
+# Binary caches (guardrails)
+home/.local/bin-core/*
+!home/.local/bin-core/cnr_search
+!home/.local/bin-core/comfy-queue-profile
+!home/.local/bin-core/comfyui-api
+!home/.local/bin-core/comfyui-api-bench
+!home/.local/bin-core/comfyui-launch
+!home/.local/bin-core/comfyui-report
+!home/.local/bin-core/geeqie-clip.sh
+!home/.local/bin-core/github_search
+!home/.local/bin-core/gpu-clocks
+!home/.local/bin-core/gpu-fan-curve
+!home/.local/bin-core/gpu-noise-watch
+!home/.local/bin-core/gpu-profile
+!home/.local/bin-core/gpu-sdxl-sample
+!home/.local/bin-core/gpu-telemetry
+!home/.local/bin-core/hb-dnf
+!home/.local/bin-core/hb-fan-target
+!home/.local/bin-core/hb-kaomoji-face
+!home/.local/bin-core/hb-run
+!home/.local/bin-core/hype-mamba-hint
+!home/.local/bin-core/hype-status-face
+!home/.local/bin-core/probe-electrum-over-tor.py
+!home/.local/bin-core/README.md
+!home/.local/bin-core/retoswap-launch-monerod
+!home/.local/bin-core/sd-profile-suite
+!home/.local/bin-core/set-gpu
+!home/.local/bin-core/set-gpu-game
+!home/.local/bin-core/set-gpu-sd
+!home/.local/share/icons/hypebrut-copy.png
+
+# Do not track generated backups
+.dotfiles-backups/

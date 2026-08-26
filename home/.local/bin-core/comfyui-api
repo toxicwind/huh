@@ -1,0 +1,511 @@
+#!/usr/bin/env -S micromamba run -n comfyui-py312 python
+"""
+# ComfyUI API — deep ops overview for autonomous benchmarking (Illustrious/SDXL + DMD2)
+
+## The execution lifecycle (endpoints that matter)
+
+* **Discover node & server capabilities**
+
+  * `GET /object_info` → full catalogue of node classes, inputs, outputs, defaults, tooltips; use this to auto-build controls (sampler/scheduler/CFG/steps/denoise, upscaler choices). `GET /object_info/{node_class}` narrows to a single node. ([ComfyUI Documentation][1])
+  * `GET /features`, `GET /models`, `GET /models/{folder}` list features and model inventory seen by the server. ([ComfyUI Documentation][1])
+  * `GET /system_stats` → Python, devices, VRAM, etc., for run metadata. ([ComfyUI Documentation][1])
+
+* **Submit a run**
+
+  * **POST `/prompt`** with a **client_id** and a **prompt JSON** (the API-format graph). On success, you get a `prompt_id` and queue `number`; on validation error, you get `error` plus `node_errors`. **This is the primary execution entrypoint.** ([ComfyUI Documentation][1])
+  * **WebSocket `/ws?clientId=...`** mirrors progress in real time: `status`, `execution_start`, `executing`, `progress`, `executed`, `execution_cached`. Keep it open while your prompt runs to correlate events by `client_id`. ([ComfyUI Documentation][1])
+  * **GET `/queue`** (and **POST** to manage) shows in-flight/pending; **POST `/interrupt`** stops current execution. ([ComfyUI Documentation][1])
+
+* **Fetch results**
+
+  * **GET `/history/{prompt_id}`** → output files and metadata; **GET `/view?filename=...`** → stream/download the image. This is the canonical way to enumerate **original outputs** for a run. ([ComfyUI Documentation][1])
+
+* **File I/O helpers**
+
+  * **POST `/upload/image`**, **POST `/upload/mask`** to upload inputs; **GET `/userdata`** / **GET `/v2/userdata`** to list files and directories in user space; `GET/POST/DELETE /userdata/{file}` to read/write/move. ([ComfyUI Documentation][1])
+
+* **GPU memory hygiene**
+
+  * **POST `/free`** to unload specified models when you’re scripting long sweeps and want to avoid fragmentation/VRAM creep. ([ComfyUI Documentation][1])
+
+## Workflow formats you’ll touch (don’t confuse them)
+
+* **Workflow JSON (editor format)** — what the UI saves/loads and embeds into PNG metadata; schema is versioned (latest **v1.0**). It carries node geometry, groups, and links for the graph editor. Useful for storage and diffing, **not** what `/prompt` accepts. ([ComfyUI Documentation][2])
+* **Prompt JSON (API format)** — the compact, executable graph the server validates and queues via **POST `/prompt`**. Use the UI’s **“Save (API Format)”** (enable *Dev Mode Options* in Settings) to export this directly; it’s the one you parametrize for step/CFG/scheduler sweeps. ([9elements][3])
+
+  * Many teams embed the editor workflow back into outputs using `extra_data: { extra_pnginfo: { workflow: <workflow-json> } }` so every **original output** is fully reproducible. The difference between editor JSON and prompt JSON is called out by maintainers/community; don’t mix them. ([GitHub][4])
+
+## Minimal request shape (for mental RAM, not a straitjacket)
+
+* **POST `/prompt`** body conceptually looks like:
+
+  * `client_id`: stable ID you also use on `/ws` to receive progress for this run.
+  * `prompt`: a map of **stringified node ids** to `{ "class_type": "<NodeClass>", "inputs": { ... } }`—this is what the “Save (API Format)” button emits. ([9elements][3])
+
+You build the graph once, then mutate just the inputs you’re sweeping (e.g., `KSampler.sampler_name`, `scheduler`, `steps`, `cfg`, `denoise`, plus upscaler choices) before each submission.
+
+## Node introspection & dynamic controls (how to autodiscover valid values)
+
+* `GET /object_info` returns a machine-readable spec for **every node**, including:
+
+  * **Inputs** with type families (e.g., `INT`, `FLOAT`, `STRING`, `BOOLEAN`, etc.), default values, min/max, step, display hints, and flags like `forceInput`/`advanced`.
+  * **Outputs** with names, index, and type annotations.
+  * Metadata: `display_name`, `description`, `category`, and whether it’s an `output_node`. This is the basis for autogenerating GUI/CLI selectors and validating your sweeps. ([ComfyUI Documentation][5])
+
+* **Schedulers vs. samplers**: in ComfyUI these are separate knobs (e.g., `KSampler.sampler_name`, `KSampler.scheduler`), and available options are discoverable via each node’s input definition (combos/choices). Make them **selectors** in your automation; don’t hard-code. ([ComfyUI Documentation][1])
+
+* **BasicScheduler**: if you need explicit sigma schedules (reproduce identical multi-stage recipes across runs), wire a `BasicScheduler` and feed its outputs into your samplers; its parameters are also discoverable via `object_info`. ([ComfyUI Documentation][1])
+
+## “Save (API Format)” and why it matters
+
+* Enable **Dev Mode Options** in the Settings gear, then use **Save (API Format)** to export the executable prompt format that `/prompt` accepts. This avoids guessing conversions from editor JSON and prevents brittle hand-written prompts. ([9elements][3])
+
+## Live progress & correlation
+
+* Open **WebSocket**: `ws://<host>:8188/ws?clientId=<your-id>`.
+
+  * Expect messages like `{ "type": "executing", "data": { "node": 42 } }`, `status`, `progress`, `executed`, and `execution_cached`. Use `prompt_id` from the POST response to join the telemetry with what you fetch from `/history/<prompt_id>`. ([DEV Community][6])
+
+## Pulling **original outputs** and metadata
+
+* Once a prompt finishes, call **`GET /history/<prompt_id>`**; it returns the list of files and metadata the workflow produced (e.g., image paths).
+* Fetch binaries via **`/view?filename=...`**; store alongside your CSV/JSON metrics for each sweep point. ([ComfyUI Documentation][1])
+
+## File handling patterns
+
+* **Inputs**: use `POST /upload/image` or `POST /upload/mask` before submitting; your prompt then references the server-side paths.
+* **User data**: **`/v2/userdata`** gives a structured directory/file view; you can `GET/POST/DELETE` individual paths and **move/rename** with `/userdata/{file}/move/{dest}`—handy for archiving per-benchmark run assets. ([ComfyUI Documentation][1])
+
+## Queue, recovery, and VRAM
+
+* **`/queue`** shows pending/running; you can clear or stop with **`POST /queue`** and **`POST /interrupt`**.
+* **`/free`** unloads named models to de-frag VRAM between sweeps.
+* For crash-safe automation, snapshot **`/queue`** and **`/history`** periodically and resume by re-posting any lost `prompt`s. ([ComfyUI Documentation][1])
+
+## Versioning & schema stability (2025)
+
+* The **Workflow JSON** and **Node Definition JSON** are formally specified and versioned in the official docs; your agent should read these on startup to guard against breaking changes (e.g., Nodes **v3** migration paths exist for custom node authors). ([ComfyUI Documentation][2])
+
+## Field-tested recipe (quick mental model)
+
+1. **Export** the API prompt (Save API Format). ([9elements][3])
+2. **Discover** valid knobs from `GET /object_info` (sampler/scheduler/CFG/steps/denoise/upscalers). ([ComfyUI Documentation][1])
+3. **POST `/prompt`** with a stable `client_id`; **watch `/ws`** until `executed`/idle. ([ComfyUI Documentation][1])
+4. **GET `/history/<prompt_id>`**, **`/view?filename=...`** to collect **original outputs** and metadata. ([ComfyUI Documentation][1])
+5. **Record** `system_stats`, parameters, runtime, it/s, VRAM peaks, and your aesthetic score. Repeat with new parameters. ([ComfyUI Documentation][1])
+
+*Reference docs that stay current: official **Routes**, **Workflow JSON**, and **Node Definition JSON** pages; community “Save (API Format)” guides; and production API patterns.* ([ComfyUI Documentation][1])
+
+[1]: https://docs.comfy.org/development/comfyui-server/comms_routes "Routes - ComfyUI"
+[2]: https://docs.comfy.org/specs/workflow_json "Workflow JSON - ComfyUI"
+[3]: https://9elements.com/blog/hosting-a-comfyui-workflow-via-api/?utm_source=chatgpt.com "Hosting a ComfyUI Workflow via API"
+[4]: https://github.com/comfyanonymous/ComfyUI/issues/1112 "API to convert workflow format to prompt format · Issue #1112 · comfyanonymous/ComfyUI · GitHub"
+[5]: https://docs.comfy.org/specs/nodedef_json "Node Definition JSON - ComfyUI"
+[6]: https://dev.to/methodox/devlog-20250710-comfyui-api-1mi0?utm_source=chatgpt.com "DevLog 20250710: ComfyUI API"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+
+DEFAULT_TIMEOUT = 300.0
+
+
+@dataclass
+class Context:
+    base_url: str
+    timeout: float
+    pretty: bool
+
+
+def build_base_url(scheme: str, host: str, port: int) -> str:
+    return f"{scheme}://{host}:{port}"
+
+
+def request_json(
+    ctx: Context,
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+) -> Any:
+    url = f"{ctx.base_url}{path}"
+    data = None
+    headers = {}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=ctx.timeout) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"[http {err.code}] {err.reason}: {detail}") from err
+    except urllib.error.URLError as err:
+        raise SystemExit(f"[net] Failed to reach {url}: {err}") from err
+
+    if not body:
+        return None
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as err:
+        raise SystemExit(f"[parse] Non-JSON response from {url}: {body[:256]!r}") from err
+
+
+def request_binary(
+    ctx: Context,
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    headers_override: dict[str, str] | None = None,
+) -> bytes:
+    url = f"{ctx.base_url}{path}"
+    data = None
+    headers = dict(headers_override or {})
+    if payload is not None:
+        headers.setdefault("Content-Type", "application/json")
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=ctx.timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"[http {err.code}] {err.reason}: {detail}") from err
+    except urllib.error.URLError as err:
+        raise SystemExit(f"[net] Failed to reach {url}: {err}") from err
+
+
+def print_json(ctx: Context, payload: Any, *, to: Path | None) -> None:
+    if payload is None:
+        return
+    text = json.dumps(payload, indent=2 if ctx.pretty else None, sort_keys=ctx.pretty)
+    if to:
+        to.write_text(text + ("\n" if not text.endswith("\n") else ""), encoding="utf-8")
+    else:
+        print(text)
+
+
+def cmd_object_info(ctx: Context, args: argparse.Namespace) -> None:
+    target = args.node_class.strip() if args.node_class else ""
+    path = f"/object_info/{urllib.parse.quote(target, safe='')}" if target else "/object_info"
+    result = request_json(ctx, path)
+    print_json(ctx, result, to=args.output)
+
+
+def cmd_features(ctx: Context, args: argparse.Namespace) -> None:
+    result = request_json(ctx, "/features")
+    print_json(ctx, result, to=args.output)
+
+
+def cmd_models(ctx: Context, args: argparse.Namespace) -> None:
+    if args.folder:
+        path = f"/models/{urllib.parse.quote(args.folder, safe='')}"
+    else:
+        path = "/models"
+    result = request_json(ctx, path)
+    print_json(ctx, result, to=args.output)
+
+
+def cmd_system_stats(ctx: Context, args: argparse.Namespace) -> None:
+    result = request_json(ctx, "/system_stats")
+    print_json(ctx, result, to=args.output)
+
+
+def load_json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"[file] Not found: {path}") from None
+    except json.JSONDecodeError as err:
+        raise SystemExit(f"[parse] JSON error in {path}: {err}") from err
+
+
+def cmd_prompt(ctx: Context, args: argparse.Namespace) -> None:
+    payload = load_json_file(args.prompt)
+    body: dict[str, Any] = {"prompt": payload}
+    if args.client_id:
+        body["client_id"] = args.client_id
+    if args.extra_data:
+        extra = load_json_file(args.extra_data)
+        body.setdefault("extra_data", extra)
+    result = request_json(ctx, "/prompt", method="POST", payload=body)
+    print_json(ctx, result, to=args.output)
+
+
+def cmd_history(ctx: Context, args: argparse.Namespace) -> None:
+    path = f"/history/{urllib.parse.quote(args.prompt_id, safe='')}"
+    result = request_json(ctx, path)
+    if args.extract and isinstance(result, dict):
+        entry = result.get(args.prompt_id)
+        if args.extract == "outputs" and entry:
+            result = entry.get("outputs")
+        elif args.extract == "status" and entry:
+            result = entry.get("status")
+        elif args.extract == "performance" and entry:
+            result = entry.get("performance")
+    print_json(ctx, result, to=args.output)
+
+
+def cmd_queue(ctx: Context, args: argparse.Namespace) -> None:
+    result = request_json(ctx, "/queue")
+    print_json(ctx, result, to=args.output)
+
+
+def cmd_interrupt(ctx: Context, args: argparse.Namespace) -> None:
+    payload: dict[str, Any] | None = None
+    if args.prompt_id:
+        payload = {"prompt_id": args.prompt_id}
+    result = request_json(ctx, "/interrupt", method="POST", payload=payload)
+    print_json(ctx, result, to=args.output)
+
+
+def cmd_free(ctx: Context, args: argparse.Namespace) -> None:
+    payload = {
+        "free_memory": True,
+        "unload_models": args.unload_models,
+    }
+    if args.models:
+        payload["models"] = args.models
+    result = request_json(ctx, "/free", method="POST", payload=payload)
+    print_json(ctx, result, to=args.output)
+
+
+def cmd_view(ctx: Context, args: argparse.Namespace) -> None:
+    query = urllib.parse.urlencode({"filename": args.filename})
+    data = request_binary(ctx, f"/view?{query}")
+    if args.output:
+        args.output.write_bytes(data)
+    else:
+        sys.stdout.buffer.write(data)
+
+
+def cmd_userdata(ctx: Context, args: argparse.Namespace) -> None:
+    base = "/v2/userdata" if args.v2 else "/userdata"
+    path = base
+    if args.path:
+        encoded = "/".join(
+            urllib.parse.quote(part, safe="") for part in args.path.strip("/").split("/")
+        )
+        path = f"{base}/{encoded}"
+    result = request_json(ctx, path)
+    print_json(ctx, result, to=args.output)
+
+
+def encode_multipart(
+    fields: Iterable[tuple[str, str]],
+    files: Iterable[tuple[str, str, bytes, str]],
+) -> tuple[bytes, str]:
+    boundary = f"comfyui-api-{uuid.uuid4().hex}"
+    lines: list[bytes] = []
+    for name, value in fields:
+        header = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+        )
+        lines.append(header.encode("utf-8"))
+        lines.append(value.encode("utf-8"))
+        lines.append(b"\r\n")
+    for name, filename, data, content_type in files:
+        header = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        )
+        lines.append(header.encode("utf-8"))
+        lines.append(data)
+        lines.append(b"\r\n")
+    lines.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(lines)
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
+
+
+def request_multipart_json(
+    ctx: Context,
+    path: str,
+    *,
+    fields: Iterable[tuple[str, str]],
+    files: Iterable[tuple[str, str, bytes, str]],
+) -> Any:
+    body, content_type = encode_multipart(fields, files)
+    headers = {"Content-Type": content_type}
+    url = f"{ctx.base_url}{path}"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=ctx.timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"[http {err.code}] {err.reason}: {detail}") from err
+    except urllib.error.URLError as err:
+        raise SystemExit(f"[net] Failed to reach {url}: {err}") from err
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise SystemExit(f"[parse] Non-JSON response from {url}: {raw[:256]!r}") from err
+
+
+def cmd_upload(ctx: Context, args: argparse.Namespace) -> None:
+    payload_fields: list[tuple[str, str]] = [("subfolder", args.subfolder)] if args.subfolder else []
+    if args.type:
+        payload_fields.append(("type", args.type))
+    if args.overwrite:
+        payload_fields.append(("overwrite", "1"))
+    file_bytes = args.data.read_bytes()
+    files = [
+        ("image", args.remote, file_bytes, args.content_type),
+    ]
+    endpoint = "/upload/image" if args.kind == "image" else "/upload/mask"
+    result = request_multipart_json(ctx, endpoint, fields=payload_fields, files=files)
+    print_json(ctx, result, to=args.output)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Scripting shim for ComfyUI HTTP APIs.", formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--scheme", default="http", help="Server scheme")
+    parser.add_argument("--host", default="127.0.0.1", help="Server host")
+    parser.add_argument("--port", default=8188, type=int, help="Server port")
+    parser.add_argument("--timeout", default=DEFAULT_TIMEOUT, type=float, help="HTTP timeout seconds")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON responses")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional output file for JSON responses (binary commands override)",
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_object = sub.add_parser("object-info", help="Fetch /object_info or a single node")
+    p_object.add_argument("node_class", nargs="?", help="Optional node class name")
+    p_object.set_defaults(func=cmd_object_info)
+
+    p_features = sub.add_parser("features", help="Fetch /features")
+    p_features.set_defaults(func=cmd_features)
+
+    p_models = sub.add_parser("models", help="List /models or a folder")
+    p_models.add_argument("folder", nargs="?", help="Optional model folder (e.g., checkpoints)")
+    p_models.set_defaults(func=cmd_models)
+
+    p_stats = sub.add_parser("system-stats", help="Fetch /system_stats")
+    p_stats.set_defaults(func=cmd_system_stats)
+
+    p_prompt = sub.add_parser("prompt", help="POST /prompt with JSON payload")
+    p_prompt.add_argument("prompt", type=Path, help="JSON file in API prompt format")
+    p_prompt.add_argument("--client-id", help="Optional client id")
+    p_prompt.add_argument(
+        "--extra-data",
+        type=Path,
+        help="Optional JSON file to merge as extra_data (exact contents used)",
+    )
+    p_prompt.set_defaults(func=cmd_prompt)
+
+    p_history = sub.add_parser("history", help="Fetch /history/<prompt_id>")
+    p_history.add_argument("prompt_id", help="Prompt identifier")
+    p_history.add_argument(
+        "--extract",
+        choices={"outputs", "status", "performance"},
+        help="Extract a specific field from the history entry",
+    )
+    p_history.set_defaults(func=cmd_history)
+
+    p_queue = sub.add_parser("queue", help="Fetch /queue")
+    p_queue.set_defaults(func=cmd_queue)
+
+    p_interrupt = sub.add_parser("interrupt", help="POST /interrupt")
+    p_interrupt.add_argument("--prompt-id", help="Optional prompt id to target")
+    p_interrupt.set_defaults(func=cmd_interrupt)
+
+    p_free = sub.add_parser("free", help="POST /free to clear caches")
+    p_free.add_argument("--unload-models", action="store_true", help="Unload models as part of freeing memory")
+    p_free.add_argument(
+        "--models",
+        nargs="+",
+        help="Optional explicit model names to free (passed to /free)",
+    )
+    p_free.set_defaults(func=cmd_free)
+
+    p_view = sub.add_parser("view", help="GET /view to download an asset")
+    p_view.add_argument("filename", help="Remote filename as reported by /history")
+    p_view.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Destination path for the downloaded binary (stdout if omitted)",
+    )
+    p_view.set_defaults(func=cmd_view)
+
+    p_userdata = sub.add_parser("userdata", help="List files via /userdata or /v2/userdata")
+    p_userdata.add_argument("path", nargs="?", help="Optional relative path under userdata")
+    p_userdata.add_argument("--v2", action="store_true", help="Use /v2/userdata endpoint")
+    p_userdata.set_defaults(func=cmd_userdata)
+
+    p_upload = sub.add_parser("upload", help="Upload an image or mask via /upload")
+    p_upload.add_argument("data", type=Path, help="Local file to upload (binary)")
+    p_upload.add_argument("remote", help="Remote filename to write under userdata")
+    p_upload.add_argument(
+        "--kind",
+        choices={"image", "mask"},
+        default="image",
+        help="Upload endpoint selection",
+    )
+    p_upload.add_argument(
+        "--subfolder",
+        help="Optional subfolder relative to the target type directory",
+    )
+    p_upload.add_argument(
+        "--type",
+        choices={"input", "temp", "output"},
+        help="Target directory type (defaults to input)",
+    )
+    p_upload.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow overwriting existing files",
+    )
+    p_upload.add_argument(
+        "--content-type",
+        default="application/octet-stream",
+        help="MIME type to declare for the upload",
+    )
+    p_upload.set_defaults(func=cmd_upload)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    ctx = Context(
+        base_url=build_base_url(args.scheme, args.host, args.port),
+        timeout=args.timeout,
+        pretty=args.pretty,
+    )
+    ctx_output: Path | None = None
+    if hasattr(args, "output") and isinstance(args.output, Path | None):
+        ctx_output = args.output
+    args.output = ctx_output
+    args.func(ctx, args)
+
+
+if __name__ == "__main__":
+    main()

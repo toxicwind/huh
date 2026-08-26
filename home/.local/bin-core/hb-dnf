@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# hb-dnf — opinionated dnf wrapper with logging, mirror tuning, and optional sudo password feed
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+	echo "usage: hb-dnf <dnf args...>" >&2
+	exit 64
+fi
+
+LOG_DIR=${HB_DNF_LOG_DIR:-$HOME/logs/dnf}
+mkdir -p "$LOG_DIR"
+stamp=$(date +%Y%m%d-%H%M%S)
+log="$LOG_DIR/${stamp}.log"
+
+dnf_cmd=(dnf --setopt=fastestmirror=True --setopt=max_parallel_downloads=10
+	--setopt=install_weak_deps=False --setopt=keepcache=True -y "$@")
+
+sudo_cmd=(sudo)
+if [[ -n ${HB_DNF_PASSWORD:-} ]]; then
+	sudo_cmd+=(-S)
+fi
+
+printf '==> %s\n' "${sudo_cmd[*]} ${dnf_cmd[*]}" | tee "$log"
+if [[ -n ${HB_DNF_PASSWORD:-} ]]; then
+	{ printf '%s\n' "$HB_DNF_PASSWORD" | "${sudo_cmd[@]}" "${dnf_cmd[@]}"; } 2>&1 | tee -a "$log"
+	status=${PIPESTATUS[1]}
+else
+	{ "${sudo_cmd[@]}" "${dnf_cmd[@]}"; } 2>&1 | tee -a "$log"
+	status=${PIPESTATUS[0]}
+fi
+exit "$status"

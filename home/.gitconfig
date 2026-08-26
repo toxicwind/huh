@@ -1,0 +1,28 @@
+[user]
+	email = toxicwind@gmail.com
+	name = toxicwind
+[pull]
+	rebase = false
+[filter "lfs"]
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
+	process = git-lfs filter-process
+	required = true
+[core]
+	pager = delta
+
+[interactive]
+	diffFilter = delta --color-only
+
+[delta]
+	navigate = true
+	line-numbers = true
+	features = oxide
+
+[delta "oxide"]
+	syntax-theme = OneHalfDark
+	zero-style = syntax "#1f232d" "#2b303b"
+	plus-style = syntax "#1f232d" "#1f3b36"
+	minus-style = syntax "#1f232d" "#3b1f25"
+	commit-decoration-style = bold accent
+	hunk-header-decoration-style = omit
