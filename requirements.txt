@@ -1,1 +1,5 @@
-urllib3>=2.0
+# huh-osint — Pure stdlib, no external dependencies required
+# Python 3.10+ recommended
+# Optional enhancements:
+#   nest_asyncio>=1.5.0  # if running in Jupyter
+#   websocket-client>=1.0  # for advanced Chrome CDP
